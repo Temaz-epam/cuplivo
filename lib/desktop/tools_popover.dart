@@ -6,8 +6,11 @@ import 'package:provider/provider.dart';
 
 import '../icons/lucide_adapter.dart';
 import '../l10n/app_localizations.dart';
+import '../core/models/conversation.dart';
 import '../core/providers/mcp_provider.dart';
 import '../core/providers/assistant_provider.dart';
+import '../core/services/proactive_care_alarm_service.dart';
+import '../features/home/widgets/conversation_proactive_care_sheet.dart';
 import '../features/home/services/local_tool_labels.dart';
 import '../features/home/services/local_tool_toggle.dart';
 import 'package:Cuplivo/theme/app_font_weights.dart';
@@ -238,6 +241,29 @@ class _ToolsContent extends StatelessWidget {
     final enabledLocalTools = a.localToolIds.toSet();
 
     final rows = <WidgetBuilder>[];
+    // The assistant tool list can outgrow the popover's height cap, so the
+    // conversation-level care entry stays pinned above it.
+    final careConversation = widget.conversation;
+    if (ProactiveCareAlarmService.isSupported && careConversation != null) {
+      rows.add(
+        (context) => _RowItem(
+          key: const ValueKey<String>('desktop-tools-proactive-care'),
+          leading: Icon(Lucide.HeartPulse, size: 16, color: cs.onSurface),
+          label: l10n.conversationProactiveCareTitle,
+          selected: false,
+          onTap: () {
+            widget.onDone();
+            unawaited(
+              showConversationProactiveCare(
+                context,
+                conversation: careConversation,
+                assistant: a,
+              ),
+            );
+          },
+        ),
+      );
+    }
     if (localToolIds.isNotEmpty) {
       rows.add(
         (context) => _SectionLabel(text: l10n.assistantEditPageLocalToolsTab),
