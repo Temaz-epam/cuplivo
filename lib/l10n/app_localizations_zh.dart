@@ -1462,6 +1462,12 @@ class AppLocalizationsZh extends AppLocalizations {
   String get hotkeyFocusInput => '聚焦输入框';
 
   @override
+  String get hotkeyCopySelectionMarkdown => '复制选中为 Markdown';
+
+  @override
+  String get hotkeyReplySelection => '回复选中内容';
+
+  @override
   String get hotkeysPressShortcut => '按下快捷键';
 
   @override
@@ -2373,6 +2379,15 @@ class AppLocalizationsZh extends AppLocalizations {
   String get messageMoreSheetEdit => '编辑';
 
   @override
+  String get messageQuotePreviewRemove => '移除回复';
+
+  @override
+  String get messageQuoteTargetMissing => '原消息不可用';
+
+  @override
+  String get messageMoreSheetReply => '回复';
+
+  @override
   String get messageMoreSheetShare => '分享';
 
   @override
@@ -2415,6 +2430,9 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get chatMessageWidgetCopiedToClipboard => '已复制到剪贴板';
+
+  @override
+  String get chatMessageWidgetReplySelection => '回复';
 
   @override
   String get chatMessageWidgetResendTooltip => '重新发送';
@@ -14693,6 +14711,12 @@ class AppLocalizationsZhHans extends AppLocalizationsZh {
   String get hotkeyFocusInput => '聚焦输入框';
 
   @override
+  String get hotkeyCopySelectionMarkdown => '复制选中为 Markdown';
+
+  @override
+  String get hotkeyReplySelection => '回复选中内容';
+
+  @override
   String get hotkeysPressShortcut => '按下快捷键';
 
   @override
@@ -15604,6 +15628,15 @@ class AppLocalizationsZhHans extends AppLocalizationsZh {
   String get messageMoreSheetEdit => '编辑';
 
   @override
+  String get messageQuotePreviewRemove => '移除回复';
+
+  @override
+  String get messageQuoteTargetMissing => '原消息不可用';
+
+  @override
+  String get messageMoreSheetReply => '回复';
+
+  @override
   String get messageMoreSheetShare => '分享';
 
   @override
@@ -15646,6 +15679,9 @@ class AppLocalizationsZhHans extends AppLocalizationsZh {
 
   @override
   String get chatMessageWidgetCopiedToClipboard => '已复制到剪贴板';
+
+  @override
+  String get chatMessageWidgetReplySelection => '回复';
 
   @override
   String get chatMessageWidgetResendTooltip => '重新发送';
@@ -27850,6 +27886,12 @@ class AppLocalizationsZhHant extends AppLocalizationsZh {
   String get hotkeyFocusInput => '聚焦輸入框';
 
   @override
+  String get hotkeyCopySelectionMarkdown => '複製選取為 Markdown';
+
+  @override
+  String get hotkeyReplySelection => '回覆選取內容';
+
+  @override
   String get hotkeysPressShortcut => '按下快捷鍵';
 
   @override
@@ -28761,6 +28803,15 @@ class AppLocalizationsZhHant extends AppLocalizationsZh {
   String get messageMoreSheetEdit => '編輯';
 
   @override
+  String get messageQuotePreviewRemove => '移除回覆';
+
+  @override
+  String get messageQuoteTargetMissing => '原訊息不可用';
+
+  @override
+  String get messageMoreSheetReply => '回覆';
+
+  @override
   String get messageMoreSheetShare => '分享';
 
   @override
@@ -28803,6 +28854,9 @@ class AppLocalizationsZhHant extends AppLocalizationsZh {
 
   @override
   String get chatMessageWidgetCopiedToClipboard => '已複製到剪貼簿';
+
+  @override
+  String get chatMessageWidgetReplySelection => '回覆';
 
   @override
   String get chatMessageWidgetResendTooltip => '重新傳送';
