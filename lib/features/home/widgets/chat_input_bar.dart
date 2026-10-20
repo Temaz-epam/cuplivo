@@ -422,7 +422,7 @@ class _NativeComposerOwner extends ChangeNotifier {
             target.enqueueImages(
               data.paths,
               compression,
-              deleteSourcesAfterProcessing: true,
+              ownsSourceFile: true,
             );
           } else if (data.text case final text? when text.isNotEmpty) {
             await _registerText(target, text, asFile, threshold);
@@ -480,7 +480,7 @@ class _NativeComposerOwner extends ChangeNotifier {
       target.enqueueImages(
         [file.path],
         compression,
-        deleteSourcesAfterProcessing: true,
+        ownsSourceFile: true,
       );
       registered = true;
     } finally {
