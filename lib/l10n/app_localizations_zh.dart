@@ -10423,6 +10423,9 @@ class AppLocalizationsZh extends AppLocalizations {
   String get recycleBinRestoreUnsupported => '当前版本无法恢复该条目';
 
   @override
+  String get recycleBinRestoreNoWorkspace => '该文件所属的工作区已被删除，没有可以放回的位置。';
+
+  @override
   String get recycleBinRestoreFailed => '恢复失败';
 
   @override
@@ -10505,6 +10508,9 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get recycleBinDetailCopyJson => '复制 JSON';
+
+  @override
+  String get recycleBinDetailCopyText => '复制文本';
 
   @override
   String get recycleBinDetailCopied => '已复制';
@@ -24023,6 +24029,9 @@ class AppLocalizationsZhHans extends AppLocalizationsZh {
   String get recycleBinRestoreUnsupported => '当前版本无法恢复该条目';
 
   @override
+  String get recycleBinRestoreNoWorkspace => '该文件所属的工作区已被删除，没有可以放回的位置。';
+
+  @override
   String get recycleBinRestoreFailed => '恢复失败';
 
   @override
@@ -24105,6 +24114,9 @@ class AppLocalizationsZhHans extends AppLocalizationsZh {
 
   @override
   String get recycleBinDetailCopyJson => '复制 JSON';
+
+  @override
+  String get recycleBinDetailCopyText => '复制文本';
 
   @override
   String get recycleBinDetailCopied => '已复制';
@@ -37699,6 +37711,9 @@ class AppLocalizationsZhHant extends AppLocalizationsZh {
   String get recycleBinRestoreUnsupported => '目前版本無法還原該條目';
 
   @override
+  String get recycleBinRestoreNoWorkspace => '該檔案所屬的工作區已被刪除，沒有可以放回的位置。';
+
+  @override
   String get recycleBinRestoreFailed => '還原失敗';
 
   @override
@@ -37781,6 +37796,9 @@ class AppLocalizationsZhHant extends AppLocalizationsZh {
 
   @override
   String get recycleBinDetailCopyJson => '複製 JSON';
+
+  @override
+  String get recycleBinDetailCopyText => '複製文字';
 
   @override
   String get recycleBinDetailCopied => '已複製';
