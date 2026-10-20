@@ -543,3 +543,42 @@ flutter test test/core/services/backup/data_sync_backup_file_test.dart
 
 Failure-rate estimates in this document are per-run, from the observed CI window; they are
 order-of-magnitude, not measured rates.
+
+## 9. The 4.4 baseline: seven Windows failures that are upstream's own
+
+Not flaky — **deterministic on Windows and green everywhere else**, which is why they are
+recorded separately from the sections above: nothing in this fork can fix them without
+diverging from a test that upstream owns.
+
+Method, and it is the same one `§1`'s registered entries used: the same seven tests were run
+in the tree at `cf2af98e6` — upstream's own tip, with no Cuplivo commit applied — and all
+seven failed there identically. Upstream's `pr-check.yml` runs `ubuntu-latest` only, so its CI
+never observes them.
+
+| test | how it fails on Windows |
+|---|---|
+| `workspace_file_navigation_test.dart` › search file chips open the file preview (android, macOS) | `Expected: 'C:\Users\…\plot.png'` / `Actual: 'c:\users\…\plot.png'` — the shared thumbnail loader hands back a normalised, lower-cased path |
+| `workspace_file_navigation_test.dart` › directory chips and markdown links open a read-only file browser (android, macOS) | same normalisation mismatch |
+| `workspace_file_navigation_test.dart` › shell images use the bounded shared thumbnail loader | same |
+| `markstream_adapters_test.dart` › image providers support local files with spaces and data URLs | `Expected: 'C:\…\image one.png'` / `Actual: 'C:/…/image one.png'` — separators are normalised, case is not |
+| `file_preview_test.dart` › code preview lazily displays files above the old size limit | `PathAccessException: Deletion failed … errno = 32` — the temp tree is still held when the test tears it down |
+
+The first five and `markstream_adapters` are one defect wearing six hats: the app compares a
+path it normalised against the path the test built with `p.join`, and the two disagree about
+case and separators on this platform. `file_preview_test` is the locked-temp-tree class `§3`
+already documents.
+
+Registered in `.toolbridge/known-failures.json` as `kind: "platform"` so a local Windows run
+reports them as baseline rather than as new failures. If upstream fixes its assertions, the
+entries go away with them.
+
+### Three that were ours, and are fixed
+
+The same full-suite run surfaced three failures that did **not** reproduce upstream: both
+`markdown_playground_test.dart` cases and `mobile_background_settings_page_test.dart`, all
+reporting `Multiple exceptions (2|3) were detected`. One cause: `assets/app_icon_about.png` was
+in the tree and loaded by five call sites but had dropped out of `pubspec.yaml`'s asset list
+when the re-base rebuilt that file from upstream's copy, so `rootBundle` could not load it.
+Declaring it again fixed all three, and `app_mark_assets_test.dart` — which is this fork's own
+guard for exactly that class — had been red for the same reason.
+
