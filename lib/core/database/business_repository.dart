@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import 'package:drift/drift.dart';
 
+import '../../utils/app_directories.dart';
 import '../models/memory_entry.dart';
 import '../services/sync/sync_merge.dart';
 import '../services/sync/sync_models.dart';
@@ -560,20 +561,48 @@ WHERE id IN ($placeholders);
   // in through a crafted key.
   // ---------------------------------------------------------------------------
 
-  /// Entity kinds that never ride sync. Workspaces are host paths and local
-  /// project directories by definition. Skills ride as record + directory
-  /// blob since slice 3; the record no longer travels alone because the blob
-  /// channel guarantees the body follows it.
-  static const syncExcludedKinds = <BusinessEntityKind>{
-    BusinessEntityKind.workspace,
-  };
+  /// Whether one stored row is invisible to sync — in either direction.
+  ///
+  /// Workspaces are the only kind with a *row-level* exclusion, for three
+  /// reasons that all come down to the folder behind the row:
+  ///
+  /// * A linked workspace ([isLinkedWorkspace]) is a folder the user already
+  ///   had, named by a path on *this* machine's filesystem: device-local by
+  ///   definition, exactly as in a backup. A managed workspace is a directory
+  ///   Cuplivo owns and copies, which is the thing sync is for.
+  /// * The row id is interpolated into `<appData>/workspaces/<id>/files`
+  ///   ([AppDirectories.workspaceFilesDir]) and it arrives from the wire. An id
+  ///   that is not a single safe path segment ([isSafeWorkspaceId]) would name
+  ///   a directory outside the managed tree.
+  /// * The payload names the workspace *again*, and that second id is the one
+  ///   the app lists, updates and deletes by ([workspacePayloadNamesId]): a row
+  ///   whose halves disagree is malformed rather than a workspace, and a delete
+  ///   of it would remove the app data root itself.
+  ///
+  /// All kinds share one table and one wire name, so the rule cannot be per
+  /// kind — it is per row, and every path that offers, reads, accepts or
+  /// deletes a row applies it, so such a row is invisible in both directions.
+  static bool _syncSkipsRow(
+    BusinessEntityKind kind,
+    String id,
+    Object? payload,
+  ) {
+    if (kind != BusinessEntityKind.workspace) return false;
+    if (!isSafeWorkspaceId(id)) return true;
+    // A workspace payload is a JSON object or the row is not one either: every
+    // reader below decodes it and would otherwise be reading a shape the store
+    // cannot even hand back.
+    if (payload is! String) return true;
+    final decoded = decodePayloadObject(payload);
+    if (decoded == null) return true;
+    return isLinkedWorkspace(payload) || !workspacePayloadNamesId(decoded, id);
+  }
 
   /// Ids per `IN (...)` batch, well under SQLite's bound-variable limit.
   static const _syncIdBatch = 200;
 
   static final Map<String, BusinessEntityKind> _syncKindByWire = {
-    for (final kind in BusinessEntityKind.values)
-      if (!syncExcludedKinds.contains(kind)) kind.wireName: kind,
+    for (final kind in BusinessEntityKind.values) kind.wireName: kind,
   };
 
   static Iterable<BusinessEntityKind> get _syncKinds => _syncKindByWire.values;
@@ -587,6 +616,10 @@ WHERE id IN ($placeholders);
   /// mutation clock and a content hash of its payload. The hash is what makes
   /// "same clock, different content" visible, so a clock tie still exchanges
   /// rows and resolves by deviceId instead of silently diverging.
+  ///
+  /// Rows [_syncSkipsRow] rejects are absent here, which is what keeps a linked
+  /// workspace out of every downstream decision: an id this manifest never
+  /// announced can also never be fetched, deleted or written into a checkpoint.
   Future<List<({String kindWire, String id, int updatedAtUs, String digest})>>
   syncEntityRefs() async {
     final refs =
@@ -602,8 +635,9 @@ WHERE id IN ($placeholders);
           )
           .get();
       for (final row in rows) {
-        final id = row.read<String>(kind.idColumn);
         final payload = row.read<String>('payload');
+        final id = row.read<String>(kind.idColumn);
+        if (_syncSkipsRow(kind, id, payload)) continue;
         refs.add((
           kindWire: kind.wireName,
           id: id,
@@ -636,7 +670,9 @@ WHERE id IN ($placeholders);
   }
 
   /// The row ids of one syncable kind (empty for a kind this build does not
-  /// sync). Extension kinds share a table, so the kind column filters.
+  /// sync). Extension kinds share a table, so the kind column filters — and a
+  /// row [_syncSkipsRow] rejects is not an id this device has, which is what
+  /// keeps the id set equal to the announced manifest.
   Future<Set<String>> syncEntityIds(String kindWire) async {
     final kind = syncKindForWire(kindWire);
     if (kind == null) return const {};
@@ -645,13 +681,24 @@ WHERE id IN ($placeholders);
         : " WHERE kind = '${kind.extensionKind}'";
     final rows = await _database
         .customSelect(
-          'SELECT ${kind.idColumn} FROM ${kind.tableName}$extensionFilter;',
+          'SELECT ${kind.idColumn}, payload FROM '
+          '${kind.tableName}$extensionFilter;',
         )
         .get();
-    return {for (final row in rows) row.read<String>(kind.idColumn)};
+    final ids = <String>{};
+    for (final row in rows) {
+      final id = row.read<String>(kind.idColumn);
+      if (_syncSkipsRow(kind, id, row.data['payload'])) continue;
+      ids.add(id);
+    }
+    return ids;
   }
 
-  /// The named entity rows, as raw column maps ready to travel.
+  /// The named entity rows, as raw column maps ready to travel. A row this
+  /// device does not offer is not served either, however it was named: the id
+  /// list can arrive from the wire (a fetch request names what a peer wants),
+  /// and a linked workspace's row must not leave the device even then — the
+  /// same filter the manifest and the apply path already apply.
   Future<List<Map<String, dynamic>>> syncReadEntityRows(
     String kindWire,
     Set<String> ids,
@@ -671,9 +718,11 @@ WHERE id IN ($placeholders);
             variables: [for (final id in batch) Variable<String>(id)],
           )
           .get();
-      rows.addAll([
-        for (final row in result) Map<String, dynamic>.from(row.data),
-      ]);
+      for (final row in result) {
+        final id = row.read<String>(kind.idColumn);
+        if (_syncSkipsRow(kind, id, row.data['payload'])) continue;
+        rows.add(Map<String, dynamic>.from(row.data));
+      }
     }
     return rows;
   }
@@ -734,6 +783,12 @@ WHERE id IN ($placeholders);
         for (final row in entry.value) {
           final id = row[kind.idColumn];
           if (id is! String || id.isEmpty) continue;
+          // A row this device would never offer is a row it never accepts
+          // either. For a linked workspace that is not tidiness: the payload
+          // names a folder on *this* machine's filesystem, and a peer must not
+          // be able to plant one here. The id is half of the same rule — it is
+          // what names the folder Cuplivo would create, index and delete.
+          if (_syncSkipsRow(kind, id, row['payload'])) continue;
           final incomingAt = (row['updated_at'] as num?)?.toInt();
           if (incomingAt == null) continue;
           // An extension kind travels under its own wire name; the row must
@@ -742,6 +797,13 @@ WHERE id IN ($placeholders);
           if (kind.extensionKind != null) row['kind'] = kind.extensionKind;
           final local = await _syncEntityRow(kind, id);
           if (local != null) {
+            // The same rule on the *local* half: a row this device does not
+            // offer is not one a peer may overwrite either. Only the local
+            // payload says whether the user's linked folder sits at this id,
+            // and the incoming payload never will — so without this check a
+            // peer that guessed (or learned) the id could replace the user's
+            // link with a managed workspace.
+            if (_syncSkipsRow(kind, id, local.payload)) continue;
             if (!incomingBusinessRowWins(
               localUpdatedAtUs: local.updatedAtUs,
               incomingUpdatedAtUs: incomingAt,
@@ -808,11 +870,29 @@ WHERE id IN ($placeholders);
     );
   }
 
-  /// Deletes one entity row the peer no longer has. Returns false when there
-  /// was nothing to delete (already gone), which is not an error.
+  /// Deletes one entity row the peer no longer has.
+  ///
+  /// Returns false for a kind this build does not sync and for a row this device
+  /// keeps out of sync (see [_syncSkipsRow]) — in both cases there is nothing to
+  /// remove, which is the honest answer rather than a failure. A row that is
+  /// simply already gone still reports true: the caller asked for its absence
+  /// and has it.
   Future<bool> syncDeleteEntity(String kindWire, String id) async {
     final kind = syncKindForWire(kindWire);
     if (kind == null || id.isEmpty) return false;
+    // A row this device never offers is not deletable through sync either. The
+    // only way a delete can name a linked workspace is that the peer learned the
+    // id out of band or guessed it — nothing about that row was ever announced —
+    // and the right answer to "remove what you told me about" is that there is
+    // nothing to remove. Only workspace rows can be local-only, so no other kind
+    // pays for the lookup.
+    if (kind == BusinessEntityKind.workspace) {
+      // An id that is not a path segment names no row here, and must not name a
+      // folder either ([isSafeWorkspaceId]).
+      if (!isSafeWorkspaceId(id)) return false;
+      final local = await _syncEntityRow(kind, id);
+      if (local != null && _syncSkipsRow(kind, id, local.payload)) return false;
+    }
     final extensionFilter = kind.extensionKind == null
         ? ''
         : " AND kind = '${kind.extensionKind}'";

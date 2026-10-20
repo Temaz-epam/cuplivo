@@ -6,6 +6,7 @@ import 'package:basic_utils/basic_utils.dart';
 import 'package:crypto/crypto.dart' as crypto;
 
 import 'sync_identity.dart';
+import 'sync_limits.dart';
 import 'sync_local_addresses.dart';
 import 'sync_models.dart';
 import 'sync_store.dart';
@@ -45,6 +46,60 @@ abstract class SyncServerHandler {
   /// hash is unknown here (or the file is gone). The server only ever streams
   /// a file the handler names — a request never supplies a path.
   Future<File?> handleFetchBlob(String peerDeviceId, String contentHash);
+
+  /// The local file backing one `(workspace, path)` this device advertised in
+  /// its file table for that peer, or null when it did not advertise it — or
+  /// advertised a version the file is no longer.
+  ///
+  /// Same rule as [handleFetchBlob]: the request names something, it never
+  /// supplies a path. The handler resolves the pair through the set it walked
+  /// and published itself, so a crafted path cannot reach a file outside the
+  /// workspace (slice 18).
+  Future<File?> handleFetchWorkspaceFile(
+    String peerDeviceId,
+    String workspaceId,
+    String relPath,
+  );
+
+  /// Receives one workspace file this device asked the caller to push, as the
+  /// raw request body (slice 23).
+  ///
+  /// [size] is the body's declared length and [mtimeMs] the advertised
+  /// version's stamp. The handler accepts the pair only when this session asked
+  /// for exactly that version — the request set the push beat built is the
+  /// write authorization, and it can only name files the caller itself
+  /// advertised. Returns whether the file landed.
+  ///
+  /// A refusal reads the body out to [size] before answering instead of
+  /// closing on the peer mid-write: the peer has spent the send either way, and
+  /// what it gets back is a status it can log rather than a connection reset.
+  Future<bool> handlePutWorkspaceFile(
+    String peerDeviceId,
+    String workspaceId,
+    String relPath, {
+    required int size,
+    required Stream<List<int>> body,
+  });
+
+  /// Receives one blob this device asked the caller to push, as the raw request
+  /// body (slice 24).
+  ///
+  /// [contentHash] is the route's own hash — the one this device asked for —
+  /// and [kind] plus [key] name the entry it asked about, so the handler can
+  /// find that exact request and refuse anything else. [size] is the body's
+  /// declared length, which is what a file blob is checked against; a skill's
+  /// zip has no length agreed in advance.
+  ///
+  /// Same rule as [handlePutWorkspaceFile]: the request set the push beat built
+  /// is the write authorization. Returns whether the blob landed.
+  Future<bool> handlePutBlob(
+    String peerDeviceId,
+    String contentHash, {
+    required String kind,
+    required String key,
+    required int size,
+    required Stream<List<int>> body,
+  });
 
   /// Pairing: validate the PIN, persist the peer, answer with our identity.
   /// Returns null when the PIN is wrong or pairing is not open.
@@ -268,29 +323,114 @@ class SyncServer {
   }
 
   Future<void> _serve(HttpServer server) async {
-    // The request loop is serial, so one handler that never returns stops
-    // every later request — pairing included — for the life of the process.
-    // Each route therefore runs under a deadline: a stalled peer (Wi-Fi gone,
-    // process killed) or a body that stops arriving mid-request is answered
-    // and abandoned instead of holding the loop.
+    // The data routes still run one at a time — they share session state and a
+    // checkpoint file — but the *loop* must not block waiting for one: a data
+    // beat can run for twenty minutes, and a request the loop never reads is a
+    // request the liveness probe cannot answer. The serial lane is therefore a
+    // chained future, and the probe is dispatched straight from the loop.
+    var serial = Future<void>.value();
     await for (final request in server) {
-      try {
-        await _route(request).timeout(_deadlineFor(request.uri.path));
-      } on TimeoutException {
-        _safeRespond(request, HttpStatus.gatewayTimeout, {'error': 'timeout'});
-      } on _RequestBodyTooLarge {
-        _safeRespond(request, HttpStatus.requestEntityTooLarge, {
-          'error': 'body_too_large',
-        });
-      } catch (error, stack) {
-        _safeRespond(request, HttpStatus.internalServerError, {
-          'error': '$error',
-        });
-        // ignore: avoid_print
-        print('sync server: $error\n$stack');
+      if (request.uri.path == pingPath) {
+        // Idempotent, no session state, bounded concurrency: safe beside the
+        // lane. A probe queued behind a running session would report the peer
+        // offline for the whole session, every tick, for every peer.
+        unawaited(_servePing(request));
+        continue;
       }
+      serial = serial.then((_) => _serveSerial(request));
+    }
+    await serial;
+  }
+
+  /// One request on the serial lane, bounded by its route deadline.
+  ///
+  /// Each route runs under a deadline: a stalled peer (Wi-Fi gone, process
+  /// killed) or a body that stops arriving mid-request is answered and
+  /// abandoned instead of holding the lane. This method never throws — the
+  /// lane is a future chain, and one uncaught error would break every request
+  /// queued behind it.
+  Future<void> _serveSerial(HttpRequest request) async {
+    try {
+      await _route(request).timeout(_deadlineFor(request.uri.path));
+    } on TimeoutException {
+      _safeRespond(request, HttpStatus.gatewayTimeout, {'error': 'timeout'});
+    } on _RequestBodyTooLarge {
+      _safeRespond(request, HttpStatus.requestEntityTooLarge, {
+        'error': 'body_too_large',
+      });
+    } on SyncRequestRefusal catch (refusal) {
+      // A request the handler refused before touching any state, with the status
+      // that says *why*: a beat that belongs to no live session is a 409 the
+      // caller can act on, where the 500 every other failure produced named an
+      // exception the peer has no use for.
+      _safeRespond(request, refusal.statusCode, {'error': refusal.error});
+    } catch (error, stack) {
+      _safeRespond(request, HttpStatus.internalServerError, {
+        'error': '$error',
+      });
+      // ignore: avoid_print
+      print('sync server: $error\n$stack');
     }
   }
+
+  /// Answers one liveness probe beside the serial request lane.
+  ///
+  /// Idempotent by construction: no body, no session lookup, no write. The
+  /// answer is the point — an authenticated status line proves both halves a
+  /// sync needs (the address answers *and* this device's secret is still good),
+  /// which a bare TCP connect cannot say. The caller measures the latency
+  /// itself, so the response carries nothing.
+  Future<void> _servePing(HttpRequest request) async {
+    if (_pingsInFlight >= kMaxPingsInFlight) {
+      _safeRespond(request, HttpStatus.serviceUnavailable, {
+        'error': 'ping_busy',
+      });
+      return;
+    }
+    _pingsInFlight++;
+    try {
+      if (request.method != 'POST') {
+        _safeRespond(request, HttpStatus.methodNotAllowed, {
+          'error': 'post_only',
+        });
+        return;
+      }
+      if (_authenticatedPeer(request) == null) {
+        _safeRespond(request, HttpStatus.unauthorized, {
+          'error': SyncRefusalReason.notPaired.wire,
+        });
+        return;
+      }
+      // Drained and ignored: an empty body is the contract, and a caller that
+      // sent one must not be left with a half-read request.
+      await request.drain<void>().timeout(_pingDeadline);
+      await _respondNoContent(request, HttpStatus.noContent);
+    } catch (_) {
+      // A probe's caller is the one that classifies a failed answer; there is
+      // nothing to salvage on this side. What must *not* happen is closing a
+      // response that was never given a status: HTTP then sends 200 OK, and the
+      // caller reads a stalled body as "the peer answered in 5 s", which is the
+      // one thing a liveness probe must never invent. The deadline is named
+      // instead, so the caller sees a slow address as a slow address.
+      try {
+        await _respondNoContent(request, HttpStatus.requestTimeout);
+      } catch (_) {}
+    } finally {
+      _pingsInFlight--;
+    }
+  }
+
+  /// Probes in flight. Bounded so a peer (or a bug) cannot open thousands of
+  /// connections: the probe path answers 503 past the cap, which the caller
+  /// reads as "not now" instead of queueing it behind the session it is
+  /// supposed to outlive. The ceiling itself lives in `sync_limits.dart`,
+  /// derived from the endpoint cap — see the note there on why the two bounds
+  /// have to move together.
+  int _pingsInFlight = 0;
+
+  /// Path of the liveness probe. Authenticated like every other `/sync/*`
+  /// route, so a success is reachability *and* pairing, in one round trip.
+  static const String pingPath = '/sync/ping';
 
   /// A route's total budget. These are backstops against a peer that stops
   /// answering, not performance targets: the data routes are sized for a large
@@ -300,6 +440,11 @@ class SyncServer {
   static const _revokeDeadline = Duration(seconds: 30);
   static const _dataDeadline = Duration(minutes: 30);
 
+  /// A probe that has not answered in seconds is not slow, it is gone; it runs
+  /// on its own fast lane, so this deadline only bounds how long one of them
+  /// may hold a connection slot.
+  static const Duration _pingDeadline = Duration(seconds: 5);
+
   Duration _deadlineFor(String path) =>
       _deadlineForOverride?.call(path) ?? _defaultDeadlineFor(path);
 
@@ -307,6 +452,7 @@ class SyncServer {
     '/pair' => _pairDeadline,
     '/sync/hello' => _helloDeadline,
     '/sync/revoke' => _revokeDeadline,
+    pingPath => _pingDeadline,
     _ => _dataDeadline,
   };
 
@@ -336,6 +482,9 @@ class SyncServer {
       case '/sync/revoke':
         await _handleRevoke(request, peerDeviceId);
         break;
+      case workspaceFilePath:
+        await _handleWorkspaceFile(request, peerDeviceId);
+        break;
       default:
         if (request.uri.path.startsWith(blobPathPrefix)) {
           await _handleBlob(request, peerDeviceId);
@@ -360,8 +509,32 @@ class SyncServer {
   /// Path prefix of the blob route: `/sync/blob/<sha256>`.
   static const blobPathPrefix = '/sync/blob/';
 
-  /// A well-formed blob hash: the sha256 hex digest the manifest publishes.
-  static final RegExp _blobHashPattern = RegExp(r'^[0-9a-f]{64}$');
+  /// The workspace file route: one advertised `(workspace, relative path)` per
+  /// request, streamed back as bytes. A POST rather than a GET because the
+  /// request has a body (the pair) and a path that must not be squeezed into a
+  /// URL: workspace paths hold spaces, `#`, `%` and non-ASCII, and every one of
+  /// them would be an encoding question on one side and a decoding bug on the
+  /// other.
+  static const String workspaceFilePath = '/sync/wsfile';
+
+  /// The push direction of the same route (slice 23): the initiator streams the
+  /// bytes of one file this device asked for. The pair travels base64url in
+  /// headers — a workspace path holds spaces, `#`, `%` and non-ASCII, and base64
+  /// is the one form that needs no encoding decision on either side — and the
+  /// body is the raw file, so a large one streams through instead of being
+  /// buffered as JSON.
+  static const String workspaceIdHeader = 'x-sync-workspace';
+  static const String workspaceRelPathHeader = 'x-sync-path';
+
+  /// The push direction of the blob route (slice 24). The hash travels in the
+  /// path — it is the request's whole subject — and the entry's kind and key
+  /// travel beside it, because the receiver has to find *the entry it asked
+  /// about* rather than guess which target a hash belongs to when the same
+  /// content sits under two names. The key is base64url for the same reason a
+  /// workspace path is: it is a URI, and a header has no place to put an
+  /// encoding question.
+  static const String blobKindHeader = 'x-sync-blob-kind';
+  static const String blobKeyHeader = 'x-sync-blob-key';
 
   static bool _constantTimeEquals(String a, String b) {
     final left = utf8.encode(a);
@@ -468,25 +641,195 @@ class SyncServer {
     _respondJson(request, HttpStatus.ok, (result as SyncHello).toJson());
   }
 
-  /// Streams one blob. The hash names the content; the handler decides which
-  /// local file (if any) backs it, and a peer-supplied file entry is only ever
+  /// One blob, in either direction.
+  ///
+  /// `GET` streams the content this device published for the hash. `PUT` is the
+  /// other direction (slice 24): the initiator pushing a blob this device asked
+  /// for because it could not fetch it. The handler resolves which local file
+  /// (if any) backs a served hash, and a peer-supplied file entry is only ever
   /// remembered for a managed blob root, so a request can never read an
   /// arbitrary path off this device.
   Future<void> _handleBlob(HttpRequest request, String peerDeviceId) async {
+    if (request.method == 'PUT') {
+      await _receiveBlob(request, peerDeviceId);
+      return;
+    }
     if (request.method != 'GET') {
-      _safeRespond(request, HttpStatus.methodNotAllowed, {'error': 'get_only'});
+      _safeRespond(request, HttpStatus.methodNotAllowed, {
+        'error': 'get_or_put',
+      });
       return;
     }
     final hash = Uri.decodeComponent(
       request.uri.path.substring(blobPathPrefix.length),
     );
-    if (!_blobHashPattern.hasMatch(hash)) {
+    if (!isBlobHash(hash)) {
       _safeRespond(request, HttpStatus.badRequest, {'error': 'bad_hash'});
       return;
     }
     final file = await handler.handleFetchBlob(peerDeviceId, hash);
+    await _streamFile(request, file, error: 'blob_unavailable');
+  }
+
+  /// Receives one pushed blob. The hash is the route's subject, the entry's
+  /// kind and key are in headers, and the body is the raw bytes with a declared
+  /// length — nothing is buffered as JSON, so an attachment streams through.
+  Future<void> _receiveBlob(HttpRequest request, String peerDeviceId) async {
+    if (request.headers.value(HttpHeaders.contentEncodingHeader) != null) {
+      // The bytes are the content the hash names; a coded body would have to be
+      // decoded before its length or its digest meant anything.
+      _safeRespond(request, HttpStatus.badRequest, {'error': 'unencoded_only'});
+      return;
+    }
+    final hash = Uri.decodeComponent(
+      request.uri.path.substring(blobPathPrefix.length),
+    );
+    final kind = request.headers.value(blobKindHeader);
+    final key = _decodedHeader(request, blobKeyHeader);
+    final size = request.contentLength;
+    if (!isBlobHash(hash) ||
+        kind == null ||
+        !SyncBlobEntry.kinds.contains(kind) ||
+        key == null ||
+        key.isEmpty) {
+      _safeRespond(request, HttpStatus.badRequest, {'error': 'bad_request'});
+      return;
+    }
+    if (size < 0) {
+      // A chunked push declares no length, and the length is part of what the
+      // receiver checks a file blob against.
+      _safeRespond(request, HttpStatus.lengthRequired, {
+        'error': 'length_required',
+      });
+      return;
+    }
+    final landed = await handler.handlePutBlob(
+      peerDeviceId,
+      hash,
+      kind: kind,
+      key: key,
+      size: size,
+      body: request,
+    );
+    await _respondNoContent(
+      request,
+      landed ? HttpStatus.noContent : HttpStatus.notFound,
+    );
+  }
+
+  /// One workspace file, in either direction.
+  ///
+  /// `POST` streams back a file this device advertised to the caller. The pair
+  /// is resolved by the handler against the table it walked and published; a
+  /// pair it did not advertise — including one whose file changed since the
+  /// walk — is answered 404, which the caller counts as an unapplied file and
+  /// retries next session.
+  ///
+  /// `PUT` is the other direction: the initiator pushing a file this device
+  /// asked for, because it could not fetch it (slice 23).
+  Future<void> _handleWorkspaceFile(
+    HttpRequest request,
+    String peerDeviceId,
+  ) async {
+    if (request.method == 'PUT') {
+      await _receiveWorkspaceFile(request, peerDeviceId);
+      return;
+    }
+    if (request.method != 'POST') {
+      _safeRespond(request, HttpStatus.methodNotAllowed, {
+        'error': 'post_or_put',
+      });
+      return;
+    }
+    final body = await _readJson(request, maxBytes: _workspaceFileMaxBodyBytes);
+    if (body == null) {
+      _safeRespond(request, HttpStatus.badRequest, {'error': 'bad_json'});
+      return;
+    }
+    final workspaceId = body['ws'];
+    final relPath = body['path'];
+    if (workspaceId is! String ||
+        workspaceId.isEmpty ||
+        relPath is! String ||
+        relPath.isEmpty) {
+      _safeRespond(request, HttpStatus.badRequest, {'error': 'bad_request'});
+      return;
+    }
+    final file = await handler.handleFetchWorkspaceFile(
+      peerDeviceId,
+      workspaceId,
+      relPath,
+    );
+    await _streamFile(request, file, error: 'workspace_file_unavailable');
+  }
+
+  /// Receives one pushed workspace file. The metadata is in the headers and the
+  /// bytes are the body, so nothing is buffered and the declared length is what
+  /// the handler checks the file against.
+  Future<void> _receiveWorkspaceFile(
+    HttpRequest request,
+    String peerDeviceId,
+  ) async {
+    if (request.headers.value(HttpHeaders.contentEncodingHeader) != null) {
+      // The body is bytes, not a codec: a compressed one would have to be
+      // decompressed before its length means anything, and the length is the
+      // whole check.
+      _safeRespond(request, HttpStatus.badRequest, {'error': 'unencoded_only'});
+      return;
+    }
+    final workspaceId = _decodedHeader(request, workspaceIdHeader);
+    final relPath = _decodedHeader(request, workspaceRelPathHeader);
+    final size = request.contentLength;
+    if (workspaceId == null ||
+        workspaceId.isEmpty ||
+        relPath == null ||
+        relPath.isEmpty) {
+      _safeRespond(request, HttpStatus.badRequest, {'error': 'bad_request'});
+      return;
+    }
+    if (size < 0) {
+      // A chunked push declares no length, and this route exists to check the
+      // bytes against a length that was agreed in advance.
+      _safeRespond(request, HttpStatus.lengthRequired, {
+        'error': 'length_required',
+      });
+      return;
+    }
+    final landed = await handler.handlePutWorkspaceFile(
+      peerDeviceId,
+      workspaceId,
+      relPath,
+      size: size,
+      body: request,
+    );
+    await _respondNoContent(
+      request,
+      landed ? HttpStatus.noContent : HttpStatus.notFound,
+    );
+  }
+
+  /// One header's base64url-decoded UTF-8 value, or null when it is absent or
+  /// not that. Peer input, so it never throws.
+  static String? _decodedHeader(HttpRequest request, String name) {
+    final raw = request.headers.value(name);
+    if (raw == null || raw.isEmpty) return null;
+    try {
+      return utf8.decode(base64Url.decode(raw));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// One file, streamed with its length. A refusal (null or a file that
+  /// vanished) is a 404 with [error] as its code; a peer that hangs up
+  /// mid-stream is not an error this side can act on.
+  Future<void> _streamFile(
+    HttpRequest request,
+    File? file, {
+    required String error,
+  }) async {
     if (file == null || !await file.exists()) {
-      _safeRespond(request, HttpStatus.notFound, {'error': 'blob_unavailable'});
+      _safeRespond(request, HttpStatus.notFound, {'error': error});
       return;
     }
     try {
@@ -562,6 +905,10 @@ class SyncServer {
   /// as blobs, not in the body), so this sits far above any real batch.
   static const int _syncMaxBodyBytes = 256 * 1024 * 1024;
 
+  /// Cap on a workspace file request body: one workspace id and one relative
+  /// path. A path can be long, but nothing legitimate here is a kilobyte.
+  static const int _workspaceFileMaxBodyBytes = 64 * 1024;
+
   /// Reads and decodes one JSON object body. Null means the body was not a
   /// decodable JSON object (the caller answers 400). A body whose wire or
   /// decompressed size exceeds [maxBytes] throws [_RequestBodyTooLarge]
@@ -608,6 +955,20 @@ class SyncServer {
     _safeRespond(request, status, body);
   }
 
+  /// A status line and nothing else. 204 forbids a body, and the probe's whole
+  /// answer is the status: the caller measures the round trip itself.
+  Future<void> _respondNoContent(HttpRequest request, int status) async {
+    try {
+      request.response.statusCode = status;
+      request.response.headers.removeAll(HttpHeaders.contentEncodingHeader);
+      request.response.headers.contentType = null;
+      request.response.headers.contentLength = 0;
+      await request.response.close();
+    } catch (_) {
+      // The peer hung up first; nothing to salvage.
+    }
+  }
+
   void _safeRespond(
     HttpRequest request,
     int status,
@@ -631,4 +992,54 @@ class SyncServer {
 /// a 400.
 class _RequestBodyTooLarge implements Exception {
   const _RequestBodyTooLarge();
+}
+
+/// A request the handler refuses *before* touching any session state, carrying
+/// the status the peer should read it as.
+///
+/// [SyncServerHandler] returns payloads, not status lines, so a beat that
+/// belongs to no session could previously only be reported by throwing a
+/// `StateError` — which the server answered as a 500 and the peer classified as
+/// an internal error, naming neither the session nor the fix. A refusal the peer
+/// can act on has to name itself.
+class SyncRequestRefusal implements Exception {
+  const SyncRequestRefusal(this.statusCode, this.error);
+
+  /// A fetch beat that arrived before the push it belongs to.
+  ///
+  /// The responder's workspace ledger is what the push beat produced, so
+  /// answering the fetch without it would advance the checkpoint with an *empty*
+  /// ledger — which the content plan reads as "we never agreed about these
+  /// files" and re-transfers, and which reads a file this device deleted as a
+  /// file the peer never had.
+  const SyncRequestRefusal.pushRequired()
+    : statusCode = HttpStatus.conflict,
+      error = 'push_required';
+
+  /// The beat belongs to no live session for this peer: it was never accepted
+  /// here, or it has already ended (see the engine's session sweeps).
+  const SyncRequestRefusal.sessionMissing()
+    : statusCode = HttpStatus.conflict,
+      error = 'sync_session_missing';
+
+  /// A second push beat on a session that already took one.
+  ///
+  /// Every session is *one* push followed by one fetch, and the fetch beat
+  /// enforces its half of that ([pushRequired]); this is the other half. The
+  /// push beat writes the session's outcome — the workspace ledger, the blob
+  /// retry set, the business payload and its apply — while the counters a later
+  /// push landing books into keep accumulating, so answering a replay would
+  /// replace the outcome the report is built from and still count the bytes
+  /// twice. A client that retries a request it never got an answer for cannot be
+  /// told apart from a replay here, and a re-sent push re-runs every apply; the
+  /// honest answer is that the session already has its push.
+  const SyncRequestRefusal.pushAlreadyTaken()
+    : statusCode = HttpStatus.conflict,
+      error = 'push_already_taken';
+
+  final int statusCode;
+  final String error;
+
+  @override
+  String toString() => 'SyncRequestRefusal($statusCode): $error';
 }

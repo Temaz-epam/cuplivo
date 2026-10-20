@@ -36,6 +36,11 @@ const Duration kSyncHelloDeadline = Duration(seconds: 60);
 const Duration kSyncDataDeadline = Duration(minutes: 20);
 const Duration kSyncBlobDeadline = Duration(minutes: 15);
 
+/// Budget for one liveness probe: a request the peer answers with a bare
+/// status line. A LAN host answers in milliseconds, so anything past this is
+/// gone rather than slow.
+const Duration kSyncPingDeadline = Duration(seconds: 5);
+
 /// Budget for the pairing round: one control request against a device the user
 /// is standing in front of, so the provider's `unreachable` wording stays
 /// reachable instead of an `await` that never settles.
@@ -163,21 +168,24 @@ class SyncClient {
     Duration helloDeadline = kSyncHelloDeadline,
     Duration dataDeadline = kSyncDataDeadline,
     Duration blobDeadline = kSyncBlobDeadline,
+    Duration pingDeadline = kSyncPingDeadline,
+    Duration? connectTimeout,
   }) {
     return SyncClientSession(
-      _httpForPeer(peer),
+      _httpForPeer(peer, connectTimeout: connectTimeout),
       'https://${uriHost(host)}:$port',
       deviceId: identity.deviceId,
       token: peer.secret,
       helloDeadline: helloDeadline,
       dataDeadline: dataDeadline,
       blobDeadline: blobDeadline,
+      pingDeadline: pingDeadline,
     );
   }
 
-  HttpClient _httpForPeer(SyncPeerRecord peer) {
+  HttpClient _httpForPeer(SyncPeerRecord peer, {Duration? connectTimeout}) {
     final client = SyncClient.directClient(identity.buildContext())
-      ..connectionTimeout = kSyncDialConnectTimeout
+      ..connectionTimeout = connectTimeout ?? kSyncDialConnectTimeout
       // Pinning the listener's certificate is the whole server-side
       // authentication: nothing else can answer as this peer.
       ..badCertificateCallback = (cert, _, _) =>
@@ -195,12 +203,15 @@ class SyncClient {
   /// and many desktop users run) swallows every dial towards a peer whose
   /// address its `NO_PROXY` does not list — and that list is usually private
   /// ranges only, while a peer is remembered at whatever address its network
-  /// handed out: a NAT'd public address, or an IPv6 one. The failure mode is
-  /// nastier than a plain outage: the *probe* that decides the online dot is a
-  /// bare `Socket.connect` and bypasses the proxy, so the card showed a green
-  /// dot next to sessions that could never connect. Sync is a LAN protocol by
-  /// construction; there is no situation in which a proxy can reach a peer this
-  /// device cannot.
+  /// handed out: a NAT'd public address, or an IPv6 one. Sync is a LAN protocol
+  /// by construction; there is no situation in which a proxy can reach a peer
+  /// this device cannot.
+  ///
+  /// The probe is not a second exception to this rule any more: it goes through
+  /// this same client (see `syncEndpointProbe`), so a proxied dial and a proxied
+  /// probe agree instead of one of them reporting a peer the other can never
+  /// reach. The *pairing* walk is the remaining bare-TCP one, by necessity —
+  /// there is no secret to authenticate with until the PIN has been spent.
   static HttpClient directClient(SecurityContext context) =>
       HttpClient(context: context)..findProxy = (_) => 'DIRECT';
 
@@ -285,6 +296,7 @@ class SyncClientSession {
     this.helloDeadline = kSyncHelloDeadline,
     this.dataDeadline = kSyncDataDeadline,
     this.blobDeadline = kSyncBlobDeadline,
+    this.pingDeadline = kSyncPingDeadline,
   }) : // Public names omit the private-field prefix (ChatService convention).
        // ignore: prefer_initializing_formals
        _deviceId = deviceId,
@@ -304,6 +316,52 @@ class SyncClientSession {
 
   /// Budget for one blob: a file up to the import cap, or a skill's zip.
   final Duration blobDeadline;
+
+  /// Budget for one liveness probe.
+  final Duration pingDeadline;
+
+  /// One authenticated liveness probe: a request answered with a bare 204.
+  ///
+  /// The value is the *answer*, not the body: success means the address
+  /// answered **and** the peer still recognises this device's pairing secret,
+  /// which is the pair of facts a sync will need. Idempotent — the listener
+  /// writes nothing — so the caller may repeat it as often as it likes, and
+  /// the caller measures the elapsed time itself.
+  ///
+  /// A 503 (`ping_busy`) is not a verdict: the listener is saturated, so the
+  /// answer says nothing about the peer. It is reported as its own code so the
+  /// caller keeps whatever it already knew instead of painting the peer
+  /// offline.
+  Future<void> ping() async {
+    final request = await _client.postUrl(
+      Uri.parse('$_baseUrl${SyncServer.pingPath}'),
+    );
+    _authenticate(request);
+    request.contentLength = 0;
+    final response = await request.close().timeout(pingDeadline);
+    await response.drain<void>().timeout(pingDeadline);
+    switch (response.statusCode) {
+      case HttpStatus.noContent:
+        return;
+      case HttpStatus.serviceUnavailable:
+        throw SyncClientException(
+          'ping_busy',
+          statusCode: HttpStatus.serviceUnavailable,
+        );
+      case HttpStatus.unauthorized:
+        // This device's pairing is gone over there; the peer answered, which
+        // is still an answer.
+        throw SyncClientException(
+          'not_paired',
+          statusCode: HttpStatus.unauthorized,
+        );
+      default:
+        throw SyncClientException(
+          'ping_failed',
+          statusCode: response.statusCode,
+        );
+    }
+  }
 
   Future<SyncHelloOutcome> hello(SyncHello mine) async {
     final response = await _post(
@@ -424,6 +482,124 @@ class SyncClientSession {
     try {
       if (await file.exists()) await file.delete();
     } catch (_) {}
+  }
+
+  /// Streams one workspace file into [destination] (slice 18).
+  ///
+  /// [workspaceId] and [relPath] name a file the peer advertised in its table
+  /// for this session; anything else is refused there. There is no content hash
+  /// to verify against — a workspace file's identity is its size and mtime, and
+  /// the caller checks the size after landing (a truncated body throws here,
+  /// because the response carries its length).
+  Future<int> fetchWorkspaceFile({
+    required String workspaceId,
+    required String relPath,
+    required File destination,
+  }) async {
+    final request = await _client.postUrl(
+      Uri.parse('$_baseUrl${SyncServer.workspaceFilePath}'),
+    );
+    _authenticate(request);
+    SyncClient._writeJson(request, {'ws': workspaceId, 'path': relPath});
+    final response = await request.close().timeout(blobDeadline);
+    if (response.statusCode != HttpStatus.ok) {
+      await response.drain<void>();
+      throw SyncClientException(
+        'workspace_file_unavailable',
+        statusCode: response.statusCode,
+      );
+    }
+    var received = 0;
+    final sink = destination.openWrite();
+    try {
+      // Inactivity, not total size, is what a transfer must not wait out
+      // forever: a stalled stream is a peer that went away mid-file.
+      await for (final chunk in response.timeout(blobDeadline)) {
+        received += chunk.length;
+        sink.add(chunk);
+      }
+      await sink.flush();
+      await sink.close();
+    } catch (_) {
+      await sink.close();
+      await _deleteQuietly(destination);
+      rethrow;
+    }
+    return received;
+  }
+
+  /// Pushes one workspace file the peer asked for (slice 23).
+  ///
+  /// The pair travels base64url in headers and the bytes are the raw body with a
+  /// declared length, which is what the receiver checks the file against. No
+  /// content hash is involved for the same reason a fetched file has none: a
+  /// workspace file's identity is its size and mtime, and the mtime travels
+  /// beside the bytes so the receiver can stamp what it lands.
+  Future<void> pushWorkspaceFile({
+    required String workspaceId,
+    required String relPath,
+    required File source,
+    required WorkspaceFileStamp advertised,
+  }) async {
+    final request = await _client.putUrl(
+      Uri.parse('$_baseUrl${SyncServer.workspaceFilePath}'),
+    );
+    _authenticate(request);
+    request.headers.set(
+      SyncServer.workspaceIdHeader,
+      base64Url.encode(utf8.encode(workspaceId)),
+    );
+    request.headers.set(
+      SyncServer.workspaceRelPathHeader,
+      base64Url.encode(utf8.encode(relPath)),
+    );
+    request.headers.contentType = ContentType.binary;
+    request.headers.contentLength = advertised.size;
+    await request.addStream(source.openRead());
+    final response = await request.close().timeout(blobDeadline);
+    if (response.statusCode != HttpStatus.noContent) {
+      await response.drain<void>();
+      throw SyncClientException(
+        'workspace_push_refused',
+        statusCode: response.statusCode,
+      );
+    }
+    await response.drain<void>();
+  }
+
+  /// Pushes one blob the peer asked for (slice 24).
+  ///
+  /// The hash is the route's subject and the entry's kind and key travel in
+  /// headers, so the receiver matches the push to the exact entry it asked
+  /// about. [size] is declared as the body's length, which is what a file blob
+  /// is checked against; the bytes are the file's own, streamed rather than
+  /// buffered.
+  Future<void> pushBlob({
+    required SyncBlobEntry entry,
+    required File source,
+    required int size,
+  }) async {
+    final request = await _client.putUrl(
+      Uri.parse('$_baseUrl${SyncServer.blobPathPrefix}${entry.contentHash}'),
+    );
+    _authenticate(request);
+    request.headers.set(SyncServer.blobKindHeader, entry.kind);
+    request.headers.set(
+      SyncServer.blobKeyHeader,
+      base64Url.encode(utf8.encode(entry.key)),
+    );
+    request.headers.contentType = ContentType.binary;
+    request.headers.contentLength = size;
+    await request.addStream(source.openRead());
+    final response = await request.close().timeout(blobDeadline);
+    if (response.statusCode != HttpStatus.noContent) {
+      await response.drain<void>();
+      throw SyncClientException(
+        'blob_push_refused',
+        statusCode: response.statusCode,
+      );
+    }
+    await response.drain<void>();
   }
 
   void close() => _client.close(force: true);

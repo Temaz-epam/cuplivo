@@ -1,7 +1,10 @@
+import 'dart:convert';
+
 import 'package:Cuplivo/core/database/app_database.dart';
 import 'package:Cuplivo/core/database/business_data.dart';
 import 'package:Cuplivo/core/database/business_preferences.dart';
 import 'package:Cuplivo/core/database/business_repository.dart';
+import 'package:Cuplivo/core/database/extension_entity_store.dart';
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -242,6 +245,298 @@ void main() {
     );
     expect(outcome.entityRowsWritten, 0);
     expect(outcome.changed, isFalse);
+  });
+
+  group('workspace rows are filtered one by one', () {
+    Future<void> put(String id, {required String kind, String? hostPath}) =>
+        ExtensionEntityStore(database).upsert('workspace', id, {
+          'id': id,
+          'name': id,
+          'kind': kind,
+          'hostPath': hostPath,
+          'shellNeedsApproval': false,
+          'defaultCwd': '',
+          'disabledTools': const <String>[],
+          'createdAt': '2026-01-01T00:00:00.000Z',
+          'updatedAt': '2026-01-01T00:00:00.000Z',
+          'lastUsedAt': null,
+        });
+
+    Map<String, Object?> wireRow(String id, String kind) => {
+      'id': id,
+      'kind': 'workspace',
+      'sort_order': 0,
+      'owner_id': null,
+      'payload': jsonEncode({
+        'id': id,
+        'name': id,
+        'kind': kind,
+        'hostPath': kind == 'linked' ? '/home/me/notes' : null,
+      }),
+      'updated_at': 9000,
+    };
+
+    /// A wire row whose two identities are chosen independently, so a test can
+    /// make them disagree.
+    Map<String, Object?> wireRowWithPayload(String rowId, Object? payload) => {
+      'id': rowId,
+      'kind': 'workspace',
+      'sort_order': 0,
+      'owner_id': null,
+      'payload': payload,
+      'updated_at': 9000,
+    };
+
+    String payloadNaming(String payloadId) => jsonEncode({
+      'id': payloadId,
+      'name': 'Notes',
+      'kind': 'managed',
+      'hostPath': null,
+      'shellNeedsApproval': false,
+      'defaultCwd': '',
+      'disabledTools': const <String>[],
+      'createdAt': '2026-01-01T00:00:00.000Z',
+      'updatedAt': '2026-01-01T00:00:00.000Z',
+      'lastUsedAt': null,
+    });
+
+    test('the identity predicate reads the payload\'s own id', () {
+      expect(workspacePayloadNamesId({'id': 'w-1'}, 'w-1'), isTrue);
+      expect(workspacePayloadNamesId({'id': 'w-1'}, 'w-2'), isFalse);
+      expect(workspacePayloadNamesId({'id': '..'}, '..'), isFalse);
+      expect(workspacePayloadNamesId(const {}, 'w-1'), isFalse);
+      expect(workspacePayloadNamesId({'id': ''}, ''), isFalse);
+      expect(decodePayloadObject('not json at all'), isNull);
+      expect(decodePayloadObject('[1,2]'), isNull);
+      expect(decodePayloadObject('{"id":"w-1"}'), {'id': 'w-1'});
+    });
+
+    test('the predicate reads a payload and tolerates a broken one', () {
+      expect(isLinkedWorkspace('{"kind":"linked"}'), isTrue);
+      expect(isLinkedWorkspace('{"kind":"managed"}'), isFalse);
+      expect(isLinkedWorkspace('not json at all'), isFalse);
+      expect(isLinkedWorkspace('[1,2]'), isFalse);
+    });
+
+    test('a managed workspace is offered, a linked folder is not', () async {
+      await put('managed-1', kind: 'managed');
+      await put('linked-1', kind: 'linked', hostPath: '/home/me/notes');
+
+      expect(
+        (await repository.syncEntityRefs())
+            .where((ref) => ref.kindWire == 'workspace')
+            .map((ref) => ref.id),
+        ['managed-1'],
+      );
+      // The id set is what the delete plan diffs against and the read is what
+      // answers a fetch: both must agree with the manifest, or a linked folder
+      // could still be asked for by name.
+      expect(await repository.syncEntityIds('workspace'), {'managed-1'});
+      expect(
+        await repository.syncReadEntityRows('workspace', {'linked-1'}),
+        isEmpty,
+      );
+      expect(
+        (await repository.syncReadEntityRows('workspace', {
+          'managed-1',
+        })).single['id'],
+        'managed-1',
+      );
+    });
+
+    test('a peer can neither plant nor delete a linked folder', () async {
+      final planted = await repository.syncApplyBusinessRows(
+        entities: {
+          'workspace': [wireRow('planted', 'linked')],
+        },
+        preferences: const [],
+        myDeviceId: 'me',
+        peerDeviceId: 'peer',
+      );
+      expect(planted.entityRowsWritten, 0);
+      expect(planted.changed, isFalse);
+      expect(
+        await ExtensionEntityStore(database).get('workspace', 'planted'),
+        isNull,
+        reason: 'the row names a path on this device that the peer chose',
+      );
+
+      // The same batch with a managed row lands: the filter is per row, not a
+      // blanket refusal of the kind.
+      final accepted = await repository.syncApplyBusinessRows(
+        entities: {
+          'workspace': [wireRow('from-peer', 'managed')],
+        },
+        preferences: const [],
+        myDeviceId: 'me',
+        peerDeviceId: 'peer',
+      );
+      expect(accepted.entityRowsWritten, 1);
+
+      await put('local-linked', kind: 'linked', hostPath: '/home/me/notes');
+      expect(
+        await repository.syncDeleteEntity('workspace', 'local-linked'),
+        isFalse,
+      );
+      expect(
+        await ExtensionEntityStore(database).get('workspace', 'local-linked'),
+        isNotNull,
+        reason: 'nothing about that row was ever announced',
+      );
+      // A managed row is deleted like any other row.
+      expect(
+        await repository.syncDeleteEntity('workspace', 'from-peer'),
+        isTrue,
+      );
+      expect(
+        await ExtensionEntityStore(database).get('workspace', 'from-peer'),
+        isNull,
+      );
+    });
+    test('a workspace id that is a path is offered by nobody', () async {
+      // The id is what `AppDirectories.workspaceFilesDir` joins onto the app
+      // data root, so a row carrying one is invisible in *both* directions: it
+      // is not announced, not served by name, not deletable through sync, and
+      // not acceptable from the wire. The file path inside a workspace has had
+      // four gates since slice 18; this is the segment that precedes it.
+      await put('..', kind: 'managed');
+
+      expect(await repository.syncEntityIds('workspace'), isEmpty);
+      expect(
+        (await repository.syncEntityRefs()).where(
+          (ref) => ref.kindWire == 'workspace',
+        ),
+        isEmpty,
+        reason: 'an id nobody may name is not announced either',
+      );
+      expect(
+        await repository.syncReadEntityRows('workspace', {'..'}),
+        isEmpty,
+        reason: 'a fetch that names the traversal is served nothing',
+      );
+      expect(await repository.syncDeleteEntity('workspace', '..'), isFalse);
+
+      final applied = await repository.syncApplyBusinessRows(
+        entities: {
+          'workspace': [wireRow('..', 'managed')],
+        },
+        preferences: const [],
+        myDeviceId: 'me',
+        peerDeviceId: 'peer',
+      );
+      expect(applied.entityRowsWritten, 0);
+      expect(applied.changed, isFalse);
+    });
+
+    test('a payload that names another id is inert in both directions', () async {
+      // A workspace is identified twice: the `id` column says what the row is,
+      // and the payload's own `id` is what `Workspace.fromJson` reads — what the
+      // provider lists, an update writes and a delete removes. Only the column
+      // was ever checked, so a payload naming `..` under a safe column was a
+      // second identity nothing validated: the list showed it and a delete with
+      // files removed `<appData>` itself. The halves must agree, and a row where
+      // they do not is not offered, not served, not deletable and not accepted.
+      await ExtensionEntityStore(database).upsert(
+        'workspace',
+        'w-1',
+        jsonDecode(payloadNaming('..')) as Map<String, dynamic>,
+      );
+
+      expect(await repository.syncEntityIds('workspace'), isEmpty);
+      expect(
+        (await repository.syncEntityRefs()).where(
+          (ref) => ref.kindWire == 'workspace',
+        ),
+        isEmpty,
+      );
+      expect(
+        await repository.syncReadEntityRows('workspace', {'w-1'}),
+        isEmpty,
+      );
+      expect(await repository.syncDeleteEntity('workspace', 'w-1'), isFalse);
+      expect(
+        await ExtensionEntityStore(database).get('workspace', 'w-1'),
+        isNotNull,
+        reason: 'a row this device does not offer is not deleted through sync',
+      );
+    });
+
+    test('a peer cannot plant a row whose payload names another id', () async {
+      final applied = await repository.syncApplyBusinessRows(
+        entities: {
+          'workspace': [
+            {...wireRow('w-1', 'managed'), 'payload': payloadNaming('..')},
+          ],
+        },
+        preferences: const [],
+        myDeviceId: 'me',
+        peerDeviceId: 'peer',
+      );
+      expect(applied.entityRowsWritten, 0);
+      expect(applied.changed, isFalse);
+      expect(
+        await ExtensionEntityStore(database).get('workspace', 'w-1'),
+        isNull,
+        reason: 'the payload would have been listed under ".."',
+      );
+    });
+
+    test('a payload that is not a JSON object is not a workspace row '
+        'either', () async {
+      final applied = await repository.syncApplyBusinessRows(
+        entities: {
+          'workspace': [
+            wireRowWithPayload('w-notjson', 'not json at all'),
+            wireRowWithPayload('w-array', '[1,2]'),
+            wireRowWithPayload('w-nullid', jsonEncode({'id': null})),
+            wireRowWithPayload('w-int', 7),
+            // The control: a matching object lands, so the rule is per row.
+            wireRowWithPayload('w-good', payloadNaming('w-good')),
+          ],
+        },
+        preferences: const [],
+        myDeviceId: 'me',
+        peerDeviceId: 'peer',
+      );
+      expect(applied.entityRowsWritten, 1);
+      final store = ExtensionEntityStore(database);
+      expect(await store.get('workspace', 'w-good'), isNotNull);
+      for (final id in ['w-notjson', 'w-array', 'w-nullid', 'w-int']) {
+        expect(await store.get('workspace', id), isNull, reason: id);
+      }
+    });
+
+    test('a peer cannot replace a linked folder with a managed row', () async {
+      await put('linked-1', kind: 'linked', hostPath: '/home/me/notes');
+
+      final applied = await repository.syncApplyBusinessRows(
+        entities: {
+          // A hostile (or merely buggy) peer that knows the id: a *managed*
+          // payload so the incoming-payload filter passes, and a clock far
+          // ahead so LWW sends it through. Only the local payload says the
+          // user's own folder lives at this id, so only the local half can
+          // refuse it.
+          'workspace': [
+            {...wireRow('linked-1', 'managed'), 'updated_at': 4102444800000000},
+          ],
+        },
+        preferences: const [],
+        myDeviceId: 'me',
+        peerDeviceId: 'peer',
+      );
+
+      expect(applied.entityRowsWritten, 0);
+      expect(applied.entityRowsLost, 0);
+      final after = await ExtensionEntityStore(
+        database,
+      ).get('workspace', 'linked-1');
+      expect(
+        after!.payload['kind'],
+        'linked',
+        reason: 'the user\'s link is not the peer\'s to replace',
+      );
+      expect(after.payload['hostPath'], '/home/me/notes');
+    });
   });
 
   test('the reload picks up writes that bypassed the view', () async {

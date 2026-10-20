@@ -10,6 +10,7 @@ import 'blob_sync.dart';
 import 'business_state_reloader.dart';
 import 'sync_merge.dart';
 import 'sync_models.dart';
+import 'workspace_content_sync.dart';
 
 /// Everything sync needs from the stores, in one place: manifest building,
 /// subtree and business-row reading, transactional apply, and the reload tail
@@ -25,6 +26,7 @@ class SyncDataPlane {
     this.businessPreferences,
     this.reloader,
     this.skillDirectories,
+    this.workspaceContent,
     BlobFileHasher? fileHasher,
     this.blobPathResolver = defaultBlobPathResolver,
   }) : fileHasher = fileHasher ?? BlobFileHasher();
@@ -46,6 +48,11 @@ class SyncDataPlane {
   /// conversation-only tests; skill bodies then hash as "missing", so a skill
   /// record still converges on its own but no body is transferred.
   final SkillDirectorySync? skillDirectories;
+
+  /// Managed workspace *content* (slice 18): the folder behind a workspace row.
+  /// Null in conversation-only tests, where the records still travel and no
+  /// file ever moves.
+  final WorkspaceContentSync? workspaceContent;
 
   /// Content hashing for file blobs, memoised per (path, length, mtime).
   final BlobFileHasher fileHasher;
@@ -309,28 +316,74 @@ class SyncDataPlane {
 
   /// Deletes one business row the peer no longer has. A skill's body goes with
   /// its record: a row-less directory would be resurrected as a fresh record by
-  /// the skills rescan, and a directory-less row installs a broken skill.
+  /// the skills rescan, and a directory-less row installs a broken skill. A
+  /// *managed workspace's* folder goes with its record for the same two
+  /// reasons — a directory-less workspace looks empty in the app, and a
+  /// row-less folder is invisible there while sitting on the disk.
+  ///
+  /// **Except when the user has switched content sync off for that workspace.**
+  /// The switch promises that this device's files are its own, and a peer-driven
+  /// deletion is exactly the case that promise has to cover: the row goes (it is
+  /// gone on the peer, and a row that stayed would be re-advertised and come
+  /// back), the folder stays, and the outcome says so ([folderKept]) so the
+  /// session report can name it. Deleting it would make "off" mean "protected
+  /// only from transfers, and removed when the peer tidies up", which is not
+  /// what the switch says anywhere it is explained.
   ///
   /// The delete rides the same serialized write queue as applies and local
   /// entity edits (ADR-0003): a provider's whole-list read-modify-write must
   /// not interleave with a sync deletion either, or it re-inserts the row the
   /// checkpoint entry already dropped.
-  Future<bool> deleteBusinessRow(String kindWire, String id) async {
-    Future<bool> delete() async {
+  Future<BusinessRowDeleteOutcome> deleteBusinessRow(
+    String kindWire,
+    String id,
+  ) async {
+    Future<BusinessRowDeleteOutcome> delete() async {
       if (kindWire == kSyncPreferenceWire) {
-        return businessRepository.syncDeletePreference(id);
+        return BusinessRowDeleteOutcome(
+          removed: await businessRepository.syncDeletePreference(id),
+        );
       }
+      // Read before the delete: the row is what says whether the folder is
+      // Cuplivo's to remove (a linked workspace's is the user's own).
+      final managesFolder =
+          kindWire == WorkspaceContentSync.workspaceWire &&
+          await _isManagedWorkspace(id);
       final removed = await businessRepository.syncDeleteEntity(kindWire, id);
-      if (removed && kindWire == skillWire) {
+      if (!removed) return const BusinessRowDeleteOutcome(removed: false);
+      if (kindWire == skillWire) {
         await skillDirectories?.deleteDirectory(id);
+      } else if (managesFolder) {
+        final content = workspaceContent;
+        final off =
+            content != null &&
+            (await content.disabledWorkspaceIds()).contains(id);
+        if (off) {
+          return const BusinessRowDeleteOutcome(
+            removed: true,
+            folderKept: true,
+          );
+        }
+        await content?.deleteContent(id);
       }
-      return removed;
+      return const BusinessRowDeleteOutcome(removed: true);
     }
 
     final preferences = businessPreferences;
     return preferences == null
         ? await delete()
         : await preferences.serializeExternalWrite(delete);
+  }
+
+  /// Whether the local row [id] is a workspace Cuplivo owns the directory of.
+  Future<bool> _isManagedWorkspace(String id) async {
+    final rows = await businessRepository.syncReadEntityRows(
+      WorkspaceContentSync.workspaceWire,
+      {id},
+    );
+    if (rows.isEmpty) return false;
+    final payload = rows.first['payload'];
+    return payload is String && !isLinkedWorkspace(payload);
   }
 
   /// The checkpoint entry for a business row whose local state is the state
@@ -377,6 +430,71 @@ class SyncDataPlane {
       return;
     }
     await businessPreferences?.reload();
+  }
+
+  // ---- workspace content (slice 18) ----
+
+  /// This device's managed workspaces, with their content indexed (stat-only,
+  /// off the UI isolate). Empty when this build has no workspace content
+  /// support, which is what a conversation-only test constructs.
+  Future<List<WorkspaceContentSnapshot>> workspaceSnapshots() async =>
+      await workspaceContent?.snapshots() ?? const [];
+
+  /// The file tables to advertise for [snapshots] — one entry per workspace this
+  /// device shares, none for the rest — and how many shared workspaces the
+  /// session's table cap dropped. The count is what the report needs: a dropped
+  /// workspace is advertised as "not shared", so the peer silently plans nothing
+  /// for it.
+  ({SyncWorkspaceFileTables tables, int droppedWorkspaces}) workspaceTables(
+    List<WorkspaceContentSnapshot> snapshots,
+  ) =>
+      workspaceContent?.tablesOf(snapshots) ??
+      (tables: const {}, droppedWorkspaces: 0);
+
+  /// Publishes [snapshots] as the files this device will serve [peerDeviceId]
+  /// until the next publish — called before the beat in which that peer may
+  /// fetch, so a file it decides it needs is one this device just advertised.
+  void publishWorkspaceContent(
+    String peerDeviceId,
+    List<WorkspaceContentSnapshot> snapshots,
+  ) => workspaceContent?.publish(peerDeviceId, snapshots);
+
+  /// Drops the table this device advertised to [peerDeviceId]: the session that
+  /// published it is over, so nothing it promised may still be served.
+  void clearWorkspacePublication(String peerDeviceId) =>
+      workspaceContent?.clearServed(peerDeviceId);
+
+  /// Plans and applies this device's half of one session's workspace file
+  /// exchange: what to fetch from the peer, what to delete here because the
+  /// peer deleted it, and the ledger that records what both sides now hold.
+  ///
+  /// [allowDeletes] is false when the peer's database was bulk-replaced since
+  /// the last session (a restore): its absences then prove nothing, so a file
+  /// it lacks is re-offered rather than deleted here — the file face of the
+  /// same rule the row plan applies.
+  Future<WorkspaceContentOutcome> applyWorkspaceContent({
+    required String myDeviceId,
+    required String peerDeviceId,
+    required List<WorkspaceContentSnapshot> mine,
+    required SyncWorkspaceFileTables peerTables,
+    required Map<String, Map<String, SyncAgreedFile>> ledger,
+    required bool allowDeletes,
+    WorkspaceFileFetcher? fetch,
+  }) async {
+    final content = workspaceContent;
+    // No content support (conversation-only tests): the ledger is carried
+    // through untouched rather than emptied, so a build without the feature
+    // cannot make a build with it forget what it knew.
+    if (content == null) return WorkspaceContentOutcome(ledger: ledger);
+    return content.applyIncoming(
+      myDeviceId: myDeviceId,
+      peerDeviceId: peerDeviceId,
+      mine: mine,
+      peerTables: peerTables,
+      ledger: ledger,
+      allowDeletes: allowDeletes,
+      fetch: fetch,
+    );
   }
 
   // ---- blobs (slice 3) ----
@@ -604,4 +722,25 @@ class SyncDataPlane {
   /// Drops the served-zip cache (reproducible from the live skill bodies).
   Future<void> clearSkillBlobCache() =>
       skillDirectories?.clearBlobCache() ?? Future<void>.value();
+}
+
+/// What one peer-driven business-row deletion did.
+///
+/// Three facts, not a bool, because two of them are independent: the *row* is
+/// what the checkpoint advance and the manifest care about, and the *folder* is
+/// what the user's switch cares about. A deletion that removed the row and left
+/// the folder is a success on one face and a deliberate no-op on the other, and
+/// the session report is the only place that can say so.
+class BusinessRowDeleteOutcome {
+  const BusinessRowDeleteOutcome({
+    required this.removed,
+    this.folderKept = false,
+  });
+
+  /// The row is gone locally (so the checkpoint may advance past it).
+  final bool removed;
+
+  /// The row was a managed workspace's, the user had content sync switched off
+  /// for it, and its folder was therefore left on disk.
+  final bool folderKept;
 }

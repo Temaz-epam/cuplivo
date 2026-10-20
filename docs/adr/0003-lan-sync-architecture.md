@@ -909,7 +909,11 @@ half of the fix; three facts below it are what make it possible.
   *Rejected: upgrading the probe to a pinned TLS handshake* — it would overturn the documented
   "a probe tests the *address*, never the peer" contract, make the 30-second probe carry crypto and
   a new failure surface (self-signed certificates, IPv6 literals), and still be a weaker statement
-  than the session verdict that is now in the model for free.
+  than the session verdict that is now in the model for free. *Overturned by slice 19*: the probe is
+  now exactly that pinned, authenticated request, because "reachable" without "still paired" turned
+  out to be the wrong question — the crypto cost is bounded by asking the tiered tick about two
+  addresses rather than all of them, and the session verdict still outranks a probe answer as the
+  dot's stated source.
 - **The dial beat names its address, and "comparing data" may only appear after the hello.** The
   connecting phase was published once, before the candidate walk, and the exchanging phase was set
   *before* the hello call — so "dial → handshake → hello in flight" (up to the 3-second connect
@@ -927,6 +931,9 @@ half of the fix; three facts below it are what make it possible.
   record when engine state changes, while the file counter advances once per pulled blob, so a first
   sync of a history with images re-listed and re-decoded the whole peers directory once per file. A
   beat cannot have changed a record; the session's end still notifies the record channel once.
+  *Partly superseded by slice 20*: the label no longer carries a rank — the probe ranks every
+  candidate in parallel and the dial only walks the addresses that probe reached — while the
+  address itself, its own row and the separate notification channel all stand.
 - **A peer dial is always DIRECT.** Dart's `HttpClient` defaults to
   `findProxyFromEnvironment`, so a proxy exported in the environment (the Clash/v2ray-style
   `HTTP_PROXY`/`ALL_PROXY` that desktop users and every developer with a VPN client run) captured every
@@ -1079,6 +1086,739 @@ gate and the suppressor may read.
 - *Rejected: gating on `TickerMode`.* `IndexedStack` does not mute tickers for its non-selected
   children; the signal that actually travels is the visibility scope.
 
+## Amendment (2026-10, slice 18): workspace carriage — the record rides rows, the files ride a table
+
+Through slice 17 a workspace was the one entity kind that never travelled, and the reason was
+sound: a *linked* workspace is a host path, and a *managed* one is an unbounded local project
+directory. The product decision that overturned the blanket rule is narrower than it looks — work
+follows the user across their machines, and a workspace is where the work sits — so the rule became
+per-row and per-face instead of per-kind.
+
+- **The record travels; a linked workspace's row does not.** `isLinkedWorkspace(payload)` (parsing
+  the payload, treating an unparseable one as an ordinary row rather than throwing) is the single
+  authority the backup face and the sync face both call, so the two cannot drift apart. The
+  exclusion is *row-level* and lives at every entry point that could leak or delete: the manifest
+  refs, the id set, the payload read (the security boundary), the apply, and the delete guard (a
+  peer may neither seed nor delete a linked row here). That shape is forced by the merge rule — a
+  row that never entered a manifest cannot be read as a deletion — so "exclude this row" and "leave
+  the kind out" are *not* interchangeable, and only the former is available.
+- **Files travel on their own face, described by a table.** A per-pair, per-workspace map of
+  `relative path → (size, mtimeMs)` rides **both** directions of the delta batch. Both directions
+  because each side plans what it lacks: the responder plans inside the push beat (so the initiator
+  must publish *before* pushing), and the initiator plans after the fetch response (so the responder
+  must re-walk its index, including the files it just landed, or the initiator can never learn the
+  transfer succeeded and re-sends forever). The transfers themselves are pulls — the side that wants a
+  file fetches it over the peer's own listener — until slice 23, which added the push fallback for a
+  peer that cannot be dialled back.
+- **Identity is metadata, and the ledger is two-sided.** A file is what its size and mtime say it is;
+  no byte is read to plan a session. Each pair keeps the last revision **both** sides proved, as two
+  stamps (`mine`, `peer`) inside that pair's checkpoint, and it advances only on agreement or on a
+  file this device just *landed* and verified — never on a send (slice 23 made "landed" the rule, since
+  a pushed file lands without anyone fetching it). Two stamps rather than one tolerance
+  constant because a receiver cannot make the sender's filesystem agree with the mtime it wrote
+  (coarse-granularity filesystems round it), and "agreed" has to stay an exact comparison.
+- **Absence is a deletion, and an edit beats it.** A ledger path the peer's table no longer lists is
+  deleted here, and the mirror image holds there. The rule is only safe because of the two guards
+  below, and because a session against a bulk-replaced peer (a different data epoch) sends
+  `allowDeletes: false` — the same discipline the row faces already follow.
+- **A workspace is planned only when both sides advertised a table.** A missing table means "not
+  shared" (switched off, over a cap, not this peer's); an empty table means "shared, and it has no
+  files". For the deletion rule those are opposite statements, so the wire shape keeps them
+  distinct (a present-but-empty table survives decoding) and nothing collapses them.
+- **Caps are hard gates and the switch cannot lift them.** Over 2,000 files or 200 MB, a workspace
+  contributes **no** content — the whole block, never half a table, because a half table reads some
+  files as "never agreed" (re-send, safe) and others as "agreed" (the entry a deletion could be read
+  from). The switch is device-local (`sync/workspaces.json` holds the *disabled* set, so a new
+  workspace is on by default) and controls files alone: the record keeps travelling either way,
+  since removing a workspace from the manifest is what deletes the peer's copy.
+- **An incompletely read index is not shared at all.** If a directory cannot be listed or a file
+  cannot be stat'ed, that workspace publishes nothing that round and nothing is deleted for it, and
+  the panel says so (`无法读取`). This is a data-safety decision, not politeness: a file missing from
+  a table is indistinguishable from a deleted one, so one permission accident would otherwise delete
+  the peer's copy. The price is that a workspace with a single unreadable file syncs no content until
+  it can be read — accepted, because the alternative can destroy data and this one cannot.
+- **Landing a file is four gates, not a write.** The relative path must be safe (no absolute path, no
+  drive or ADS colon, no backslash, no NUL, no empty/`.`/`..` segment, no trailing dot or space, no
+  DOS device name); it must be lexically inside the workspace root; the *nearest existing ancestor*
+  must resolve inside it too (checked **before** `create`, because `create(recursive: true)` follows a
+  symlinked ancestor and builds the directory outside the root); and the landed size must equal the
+  advertised one. A failure fails closed — the file is treated as not applied and retried next
+  session. `setLastModified` to the peer's mtime is best-effort and logged; the ledger records each
+  side's real stamps, so a filesystem that rounds the mtime cannot turn into a re-send loop.
+- **A managed workspace row removed by sync takes its folder with it.** Leaving the directory behind
+  would hide hundreds of megabytes behind a workspace the app no longer lists.
+- *Rejected: content hashing* (a digest per file, or one per workspace). It reads every byte to
+  answer a question mtime already answers, and it is the expensive half of the "avoid a catastrophic
+  walk" requirement this slice was asked for.
+- *Rejected: directory-level LWW.* One edited file would move a whole tree, and a conflict would
+  discard the loser's entire directory instead of one file.
+- *Rejected: seeding only on the first sync* (transfer once, then leave the two copies alone). It is
+  the cheapest thing to build and the only one with no way back: after the first session the copies
+  drift with nothing to detect it.
+- *Rejected: a content digest folded into the row digest* (the C-era plan, following the skill
+  precedent). Slice 18 already re-lists every workspace's files on every session, so content needs no
+  trigger; mixing it in would make "a file changed" mean "the row changed" — an extra row transfer
+  per edit plus a fabricated LWW-loss count on the panel.
+- *Rejected: a separate ledger file per peer* (`sync/workspace-ledger/<deviceId>.json.gz`). The
+  ledger is this pair's state, advanced by one session and written at one moment, so it belongs in
+  the same atomic checkpoint write. The free consequence is what settled it: `deletePeer` and
+  `resetCheckpoints()` (the bulk-replacement hooks) already cover a checkpoint, and a ledger that
+  outlived a restore would delete the peer's files.
+- *Rejected: `Sent`/`BytesSent` counters.* The transfer is a pull, so the sending side cannot know
+  what arrived; every counter on this face counts what **this** device landed, deleted, lost or
+  withheld.
+- *Rejected: a switch that can override the caps* ("sync it anyway"). The requirement was to avoid a
+  catastrophic scan and transfer; a switch that re-enables both is that requirement with an off
+  button. The tooltip says so instead: over-cap workspaces do not sync content, the record always
+  does, and the switch only controls files.
+- Known limits of this face are collected in the consequences section below (mtime granularity and
+  clock skew, no permission bits or symlinks, rename = delete + create, the over-cap and 20k-ledger
+  drop, the unreadable-workspace freeze, and linked workspaces being absent from the panel's
+  workspace section).
+
+## Amendment (2026-10, slice 19): a probe that is a request, endpoints as first-class things, and a round that yields
+
+Slice 10 gave the pairing walk a bare TCP probe and slice 14/15 built the online dot on the same
+primitive. Both were answering the wrong question. "Something completed a TCP handshake at this
+address" is not "this peer will talk to me", and the two disagree in exactly the cases a user
+complains about — a recycled DHCP lease, a machine that happens to listen on the port, a peer that
+was unpaired on the other side.
+
+- **`POST /sync/ping`: idempotent, authenticated, and answerable beside a running session.** It
+  writes nothing and answers 204 to a caller that presents its pairing secret (401 for a pairing
+  that is gone; 503 `ping_busy` past eight probes in flight, which is a statement about the
+  listener's load rather than about the peer). A probe is now the *pair* of facts a session needs —
+  reachable **and** still paired — which is what lets the dot and the dial both read one measurement
+  instead of two disagreeing ones.
+- **The listener's request loop stopped awaiting the serial lane.** It used to be
+  `await for (request) { await route(request) }`, so a twenty-minute data beat blocked *reading the
+  next request*: any probe dispatched beside it could not be answered, and the peer looked offline
+  for the whole session. The loop now chains the serial lane (`serial = serial.then(...)`) and
+  dispatches probes straight from the loop, which is what makes a probe a viable per-tick question.
+  The guard is a request that occupies the lane with a half-sent body while a probe must still
+  answer within seconds.
+- **An endpoint is a thing, not a line of text.** The remembered set went from six addresses to
+  **twelve**; each endpoint carries a device-local `customName` (empty = the bare host is the name),
+  when it was added, how many sessions it has carried and what the last probe measured. Manual repair
+  became **per address** — add, edit or delete one, where the old "edit address" replaced the whole
+  set: the automatic memory is what failed, so retyping the rest of the set asks the user to
+  reproduce something the app already knows.
+- **Probing is tiered, and the dot forgives one miss.** A ten-second tick asks the two best-answered
+  addresses, and the silent tail (up to four) only on a full round — start, resume, a panel opening,
+  a finished session, a completed pairing. One miss is forgiven and a `ping_busy` is not a verdict;
+  two consecutive misses darken the dot. Without the tiering the cap of twelve would make every tick
+  twelve handshakes, and without the forgiveness the dot would flicker.
+- **A round that has not been answered yields to an arriving hello.** Until the peer's hello comes
+  back, an initiator round has proved nothing — it may be sitting on an address that never answers,
+  which is precisely the one-way-LAN case where the user can see the peer online on the other device
+  while this one reports failure. So a hello arriving during the dial *supersedes* the round: it
+  closes its socket and records nothing (not even a failure — the pair's real outcome is arriving
+  from the other side), and the inbound session runs. Past the hello the round is live and a peer
+  hello is refused as busy instead. The mirror case — both devices deciding to sync in the same
+  moment — is covered by one retry five seconds after a busy refusal, so a collision cannot end with
+  neither session having run. *(Corrected by slice 21: a crossing round reports `superseded`, not
+  `busy`, and the retry was armed on one caller only; the pair is now unblocked by the expiry of the
+  session a yield leaves behind.)*
+- **The dial beat names the address, and the rest of the card stops shouting.** The beat that can sit
+  for seconds is the dial, so it names the address it is trying (and, since slice 20, never a rank).
+  The header carries no IP at all — a peer is a device first — and the addresses are a grid of tiles,
+  one per (device, network) pair, each showing what that network is called and what it last measured.
+  A tile whose latest probe did not answer shows `—` rather than a stale figure, because a stale
+  number beside a silent address is the one thing that would make the grid lie; the persisted
+  measurement lives in the address's own detail view.
+- *Superseded by this slice*: **"Rejected: upgrading the probe to a pinned TLS handshake"** (slice 14
+  above). The rejection's three objections were answered rather than ignored: the "a probe tests the
+  *address*, never the peer" contract was the thing that was wrong (a peer's answer is more useful
+  than an address's); the crypto cost was bounded by asking the tick about two addresses instead of
+  every remembered one, and by keeping the pairing walk's bare TCP probe where no secret exists yet;
+  and the "weaker statement than the session verdict" argument is why the session verdict still
+  outranks a probe answer for the dot's stated source.
+- *Rejected: keeping the bare TCP connect as the dot's evidence.* It is cheap and it is wrong: it can
+  answer while every session fails, and a green dot next to failing sessions is worse than no dot.
+- *Rejected: one boolean per peer* ("one of these addresses works"). It is what the old card showed,
+  and it is why a user could not tell a dead address from a slow one or see a latency at all.
+- *Rejected: a longer endpoint memory without tiering.* Twelve addresses probed every tick is twelve
+  handshakes per tick per peer; the cap is only affordable because the tick asks the addresses that
+  already answered.
+
+## Amendment (2026-10, slice 20): the dial spends the probe instead of walking
+
+The dial used to be a walk: probe every remembered address in parallel, then dial them one at a
+time — proved first, the silent tail after — publishing `正在连接 <address>…（2/3）` as it went.
+Two things were wrong with that, and only one of them was visible in the screenshot.
+
+- **The probe was already the parallel answer.** `probePeerEndpoints` asks every address at
+  once, each with a pinned TLS handshake and an authenticated request; an address's answer is a
+  latency, a refusal, or a silence. The dial then re-asked the same addresses *serially*, paying
+  a connect budget for every repetition of a question that had just been answered in parallel.
+  The rank was the tell: `（2/3）` is a serial artefact in a system whose evidence is parallel.
+- **The rank was not something a user could act on.** "Which address is this stuck on" is
+  actionable; "the second of three guesses" is not, and it reads as a system fumbling through
+  addresses when the probe had in fact already ordered them by measured round trip.
+
+The dial now spends the proof. `dialableCandidates` keeps the addresses the probe reached —
+`answered`, or `noVerdict`, because a 503 says the listener was too loaded to judge rather than
+that the address is wrong — in measured-latency order, and those are dialed until one runs a
+session. An address the probe did not reach is not dialed. A probe that proved nothing still
+buys exactly **one** dial: the best-remembered address, the head of the set, because a single
+measurement is not a verdict on a network. That one guess is what keeps the old rule — one lost
+packet is not a permanent loss — true now that the walk is gone, and it bounds a sleeping peer's
+round at one connect budget instead of one per remembered address (twelve addresses used to cost
+up to thirty-six seconds of "connecting"). `SyncSessionProgress` loses `attempt`/`attempts`,
+`lanSyncPhaseConnectingAt` and its translations are deleted, and the beat is either
+`正在连接 <address>…` or nothing.
+
+The same review removed the last report row that said nothing new. `unreachable` — the peer
+asleep, off the Wi-Fi, on a network this device has never met — drew a banner
+(`暂时连不上——对方可能已休眠或换了网络…`) under a card whose subtitle already said
+`· 暂时连不上`. The row is gone, and the card asks `syncReportHasRow` before it renders the
+report area at all, so the empty outcome costs no stray gap above it. The manual press keeps its
+actionable line (`同步失败：连不上对方设备…重新扫描二维码或编辑地址`) in the snackbar, which
+is where an action belongs: a routine absence is a state, not an incident.
+
+- *Rejected: racing the transports at dial time* (`SecureSocket.connect` against every candidate
+  at once, the pin enforced, the first handshake winning, the rest aborted). It is the one design
+  that gives a silent address a second chance at the dial's own level and bounds the worst case
+  to a single budget instead of one per address. It was rejected on three counts: the probe
+  already buys that evidence — a pinned handshake *and* an authenticated request — once per tick,
+  so a race re-buys it per session and adds N−1 handshakes to a path that normally needs one; the
+  aborted legs arrive at the peer as connections that complete a handshake and then close without
+  a request, which the listener's `await for (final request in server)` surfaces as a stream
+  error, so the race needs accept-loop hardening that does not belong in this slice; and the case
+  it wins — the probe could not reach an address within its five-second budget while a full dial
+  could — is narrow enough to measure before paying for.
+- *Rejected: dialing nothing when the probe proved nothing.* It removes the last serial step
+  entirely and reports a sleeping peer as `unreachable` with no wait at all, but it turns one
+  missed probe into a lost round, leaving the periodic tick as the only second chance. One dial
+  is the cheaper half of that trade.
+- *Known limit.* An address that cannot answer the probe — its SYN is filtered, or it needs the
+  longer hello budget to wake — is not tried at dial time unless nothing else was proved. The
+  remedies are the ones already documented for drift (re-scan the QR, or edit the address on the
+  card), and the next tick probes again.
+
+## Amendment (2026-10, slice 21): review hardening — the walk after the apply, an id that is a path, and one yield per crossing
+
+A review of slices 18–20 turned up nine defects and one unnumbered one. They are fixed where they
+were made, and every fix is guarded by a test that was shown red before it landed. Nothing here
+changes the wire: no message shape, no protocol bump.
+
+- **The initiator plans workspace content from a walk taken after its business apply.** Slice 18's
+  initiator walk has to run before the push — the responder fetches inside that beat — but the same
+  list was then reused for the *planning* half, after the apply. A workspace record that had just
+  arrived was absent from it, so the folder that record made this device's to populate waited a whole
+  session, while the other direction transferred immediately. The planning walk is now taken after
+  `applyBusiness`, exactly as the responder's is; the pre-push walk stays what it is for (publishing
+  what this device serves inside the push beat). Both roles therefore walk twice per session, which
+  the responder already did.
+- **A workspace id is one plain path segment.** The id is interpolated into
+  `<appData>/workspaces/<id>/files` (`AppDirectories.workspaceFilesDir`) and it arrives from the wire
+  and from a backup — and only a row's *payload* had ever been validated. A paired peer advertising a
+  workspace whose id was `..` got this device to walk a directory outside the managed tree, advertise
+  it back to that peer over `/sync/wsfile`, and delete it recursively when the peer dropped the row.
+  `isSafeWorkspaceId` — a single segment: no separator of either flavour, no NUL, no colon, no
+  trailing dot or space, no DOS device name, not `.`/`..` — now joins the row-level rule that already
+  excluded linked workspaces, so such a row is invisible in **both** directions: never announced,
+  never served by name, never accepted from a peer, never deleted through sync. The filesystem sink
+  refuses the id last, so any future caller inherits the guard.
+- **The linked-row rule reads the local half too.** The apply guard inspected only the *incoming*
+  payload, so a peer's `managed` row at the id of a local `linked` workspace replaced the user's link
+  — precisely the case the guard's own comment named. The local payload is checked now as well: a row
+  this device does not offer is not one a peer may overwrite either. The peer re-offers that row every
+  session, because nothing here ever announces it; that is one skipped row per session and no data
+  moved.
+- **A yielded session is provisional.** `handleHello` cancels this device's own unanswered round when
+  the peer's hello arrives, and answers with a session instead. In a crossing dial both sides do that,
+  so neither client is left to drive either session, and each side then refuses its own dials as busy.
+  That state was permanent: `_sessions` was swept only at the top of `handleHello`, which a pair that
+  refuses its own dials never calls, and the TTL there measured **from the hello**, so it could not
+  tell a working session from an abandoned one (slice 22 splits it). A session
+  created by a yield is now marked as such and records its first beat; one the peer has not pushed
+  into within **four seconds** is dropped, and the sweep runs before `syncWithPeer` refuses a round —
+  which is the call site whose absence made the wedge unbreakable. A crossing therefore costs one
+  attempt, not a listener restart.
+- **The busy retry belongs to every trigger.** It was armed inside `autoSyncRound` alone, so the ADR's
+  own "one retry five seconds after a busy refusal" was true only of an automatic round: a manual
+  press and the post-pairing kick got no retry at all. It is armed from `syncNow`, one per round and
+  without chaining, and the delay carries an offset derived from this device's id (FNV-1a over the
+  id, folded into `[0, 1200)` ms) so two devices that collided cannot retry in lockstep and collide
+  again.
+- **A `ping_busy` is not a verdict.** A 503 from a saturated listener was stored over the previous
+  good measurement: the tile dropped to `—`, the address detail said "not reachable", and the
+  persisted latency was cleared — the opposite of what the module's own contract says ("it must not
+  overwrite a working verdict"). A `noVerdict` result now keeps the previous entry for that endpoint,
+  is never written to the peer record, and renders as `—` rather than as a reachability verdict.
+  *(On the **tick** path only: the session's own fallback round kept overwriting it, which slice 22
+  fixes at one shared choke point — the rule had two implementations and therefore one.)*
+- **The silent tail rotates.** Both probe shapes took the *first* `kSyncTailProbeCount` silent
+  addresses in endpoint order, so with more than four cold addresses the ones behind them were never
+  asked by any round — no measurement ever proved them, so the dial never tried them either, and the
+  single unproved guess a dial spends was always index 0. The cold tail is now ordered least recently
+  asked first (never-asked addresses lead, ties keep the memory's order, which is also the endpoint
+  order the guess reads), so `⌈12/4⌉` rounds cover the whole memory. The rotation falls out of the
+  answers already kept for endpoints a tick did not visit; no counter, no randomness.
+- **A root that cannot be resolved is reported, not dropped.** `snapshots()` documented that an
+  unreadable workspace is still reported — the panel has to be able to say "this one is not syncing"
+  — and then `continue`d past a `resolveRoot` failure, so the row vanished from the panel and from
+  every count. It now yields a snapshot with no root and an incomplete index, which is the same
+  refusal to share a partial tree an unreadable directory gets; the panel's existing "unreadable"
+  pill renders it and the report counts it as a workspace not syncing files.
+- **The online-dot label follows the dot.** The two session presence sources were collapsed into one
+  in slice 19, and the label was then chosen from the *source* alone: a grey dot whose last word came
+  from a failed session was labelled "Online — the last sync connected", in the tooltip and in the
+  semantics. The polarity now comes from the same flag that paints the dot, so the two cannot
+  disagree, and `lanSyncOfflineFromSession` is restored in all four locales.
+- **A measurement's age is its own.** The provider stamped a whole probe snapshot with the time it
+  was published, while it keeps the answers for endpoints a tick did not visit — so a figure from a
+  minute ago could pass the dial's fifteen-second freshness gate, take a place in the candidate
+  order, and bound that candidate's connect budget. The dial now filters per measurement
+  (`EndpointProbeResult.measuredAt`), and `PeerProbeSnapshot` — which existed only to carry the
+  mis-stamped publish time — is gone.
+- *Rejected: a device-id tie-break for a crossing dial* (only the higher id yields, so exactly one
+  session is stored). It is the smaller change and it converges in-session, but it needs to know
+  whether the peer is *also* mid-crossing, which is not locally observable — a hello is sent by every
+  dialer — so the less informed version makes the one-way case depend on the peer's next trigger
+  instead of on the arriving hello, and trades that guarantee for this one. The provisional-session
+  expiry closes the wedge without reordering the yield rule; a fully informed version would need a
+  hello-response flag, i.e. a wire change, for a case that now costs one attempt.
+- *Rejected: clearing a provisional session on an authenticated probe.* A probe lands during healthy
+  sessions too — the peer's own ten-second tick — and a session is not this device's to discard
+  because the peer can reach it. The expiry covers the abandoned case without that risk.
+- *Rejected: gating the second walk on the workspace id set.* Comparing the id set after the apply
+  (one query) and re-walking only when it changed would save a stat walk in the common case, at the
+  price of making correctness depend on a second signal agreeing with the first. The responder
+  already walks twice per session, and the walk is stat-only, capped and off the UI isolate.
+- *Rejected: dropping the local busy refusal when the held session has no beat yet.* It would let a
+  device that holds an untouched session dial instead of refusing, which breaks the one-session-per-
+  pair rule exactly when the peer's push is being built — the window in which a big library takes
+  seconds to assemble. The expiry is bounded and cannot corrupt a live session.
+- *Known limits.* A linked workspace's id, once known to a peer, is re-offered by that peer every
+  session and skipped here each time (one row, no data). A crossing dial still cannot complete a
+  session *in* the crossed round: the pair recovers on the next attempt, which a manual press or the
+  busy retry reaches within seconds. An address whose every probe answer is `ping_busy` reads as
+  unknown (`—`) rather than as either reachable or dead, which is what the answer says.
+
+## Amendment (2026-10, slice 22): review hardening — a sweep that means "idle", one fold per rule, and limits that know about each other
+
+A second review of slices 18–21 turned up four defects, three of them in code slice 21 had just
+written, plus four below-threshold items. They are fixed where they were made, every fix is guarded by
+a test that was shown red first, and the two sentences slice 21 got wrong are corrected above. No
+wire change: no message shape, no protocol bump (`kSyncProtocolVersion` stays 5; the new `409` is a
+status on an existing route).
+
+- **The sweep means "idle", not "old".** Slice 21 replaced one rule with one rule: any session older
+  than two minutes since its **hello** was dropped. A first sync of a large library is a single push
+  beat that runs for minutes, so the sweep deleted the session that was transferring, and the peer's
+  next beat — and the fetch beat that closes the session — failed against a session that no longer
+  existed (`sync_session_missing`, surfaced as a 500). It is now three states, named for their jobs:
+  `_dropIdleSessions` measures from the peer's last beat (`lastBeatAt ?? startedAt`), and skips any
+  session with a beat in flight (`beatsInFlight`, raised in `_beginBeat` and lowered in `_endBeat` in
+  `finally`, with the stamp written at *both* ends so a beat that ran for minutes is recent activity
+  when it finishes); `_dropAbandonedYieldedSessions` keeps slice 21's four-second rule for a yielded
+  session never beaten. `SyncEngine` gained a `now` clock, so the regression — a session beaten at
+  2:29 that must survive a sweep at 2:30 — is a test that runs in milliseconds instead of the 2m18s
+  probe that found it.
+- **A fetch beat requires the push it belongs to, and the ledger is never defaulted.** Every session
+  is one push then one fetch, and the responder's workspace ledger — the record of what both sides now
+  hold — is produced by the push. The fetch beat was answered regardless, and its checkpoint write
+  defaulted that ledger (`session.workspaceOutcome?.ledger ?? const {}`), so a beat that arrived
+  without its push persisted an **empty** ledger: the next session reads "we never agreed about these
+  files" and re-transfers, and reads a file deleted here as one the peer never had. `handleFetchSubtrees`
+  now refuses with `409 push_required` (`SyncRequestRefusal`, which the server maps to a status instead
+  of the 500 every handler exception used to become — `sync_session_missing` is a 409 too), and the
+  checkpoint carries `session.workspaceOutcome!.ledger`: the push is the only producer, so the outcome
+  is not optional and cannot silently become emptiness.
+- **The address cap is a refusal, and the affordance is reachable.** `SyncPeerRecord.addEndpoint`
+  appended, trimmed the set back to twelve and returned `true` — so a user's thirteenth address was
+  reported as saved and silently discarded, and the card offered "add address" only in the empty-set
+  state, which is the one state where a *second* network cannot be added. `addEndpoint` now returns
+  `SyncEndpointAdd` (`added` / `duplicate` / `invalid` / `full`) and **refuses at the cap instead of
+  evicting** a proven address; pairing's automatic learning still keeps the freshest twelve but returns
+  what it dropped, which the engine logs; the provider returns the outcome and the card says the limit
+  out loud in a snackbar. The card shows the add button whenever the set is below the cap, which is
+  also where the layout has a free cell.
+- **One probe fold, one budget, and limits that are derived from each other.** "A 503 is not a verdict"
+  had two call sites and one implementation: the tick kept a working figure, the session's own fallback
+  round overwrote it. Both now go through `_storeProbeResults`. The fan-out and the listener's
+  concurrency cap were also chosen in isolation — twelve remembered endpoints against eight answered
+  probes — so a peer's full address memory could 503 *its own* listener, and every answer came back
+  "no verdict", disabling the measurement the round existed for. `sync_limits.dart` now owns both: the
+  listener's cap is **derived** from the endpoint cap (`kMaxPingsInFlight = kMaxPeerEndpoints + 2`), the
+  probe budget is `kSyncProbeConcurrency = kMaxPeerEndpoints`, and `probePeerEndpoints` chunks rather
+  than fans out past its budget, so the relationship cannot drift again by editing one number.
+- **The per-workspace switch protects the folder from a peer-driven deletion.** `deleteBusinessRow`
+  removed a managed workspace's folder whenever the peer deleted the row, switch or no switch — so
+  "off" meant "protected from transfers, removed when the peer tidies up". With the switch off the row
+  still goes (it is gone on the peer, and a row that stayed would be re-advertised), the folder stays,
+  and the session report counts it (`workspaceFoldersKept`, one line in all four locales), because a
+  folder that is invisible in the app and present on disk has to be explained somewhere. The switch
+  keeps working in the other direction too: a switched-off workspace is neither sent nor served, and
+  flipping it off drops the current advertisement.
+- **An advertisement lives inside its session.** `_served` was only ever replaced by the next publish,
+  so a file this device advertised in one session stayed servable to that peer until the next one —
+  including after the user switched the workspace off. It is now dropped when the initiator's round
+  ends, when the peer is unpaired or revokes, and when a workspace is switched off. It is **not**
+  dropped when the responder's fetch response is written: the initiator pulls the files it was told
+  about *after* that response, and the first version of this fix did exactly that, 404-ing every
+  workspace transfer in the suite (`workspace_file_unavailable`). The next hello therefore drops the
+  previous session's table — the responder's one lasts exactly as long as the pulls it invited.
+- **The device-local switch is mutated, not read-modify-written.** `workspaces.json` holds every
+  workspace's choice in one file, and `setEnabled` read the set, edited it and wrote it back. Two
+  callers in one turn — two switches, or a switch and a session's own read — both complete their read
+  before either write, so the second write erases the first id: a switch that flips back on the next
+  read, with nothing in the logs. `SyncStore.mutateWorkspaceContentDisabled` chains read-edit-write as
+  one serialized step (with a queue that survives a failed write), and `setEnabled` is its only caller.
+- **A stalled probe answers 408, not 200.** The ping lane's `catch` closed a response that had never
+  been given a status, which HTTP sends as `200 OK`: a probe whose body stalled for five seconds
+  reported "the peer answered in 5 s", the one thing a liveness probe must never invent. It answers
+  `408` now.
+- *Rejected: a device-id tie-break for the crossing.* Reconsidered now that the crossing case has a
+  retry: a stable tie-break would still have to read a fact both sides read identically, and the pair's
+  problem is not "who speaks first" (arrival order decides that, correctly, and is what gives a
+  one-way LAN its in-session convergence) but two triggers that keep landing in the same instant. The
+  fix is a per-attempt random salt on the retry (`kSyncRetrySaltMs`), which decorrelates the *attempt*
+  rather than the device; `superseded` now arms that retry at all, which it previously did not — the
+  crossing pair waited for the next automatic trigger a minute later. Device ids stay where they
+  belong: deciding values both sides must compute identically (the LWW tie).
+- *Rejected: raising the listener's probe cap alone.* It would hide the contradiction instead of
+  relating the two numbers, and a second paired peer's tick can still saturate a listener legitimately
+  — which is why the fold must tolerate `noVerdict` on every path. The cap moved because it is derived,
+  not because a bigger number is a fix.
+- *Rejected: dropping the served table when the fetch response is written.* It is the obvious place and
+  it breaks the initiator's pull (above). The table's honest lifetime is "until the next hello, the
+  switch going off, or the pair going away".
+- *Known limits.* A folder the switch protected is orphaned: its row is gone, so nothing in the app
+  points at it until a workspace with that id is created or a backup restores one; the report line is
+  the only trace. Between sessions the responder's advertisement still serves a **paired** peer a file
+  that was walked in the previous session and has not changed since — the stamp check is what makes it
+  the same bytes, and unpaired peers are refused at the route. The sweep still cannot tell a beat that
+  is *hung* from one that is slow: a session whose beat never returns is never swept, which is the
+  deliberate trade (the alternative is killing working transfers) and is bounded by the route
+  deadlines in `sync_server.dart`.
+- *Mechanisms, not just fixes.* The sweep is guarded by a state table rather than one example
+  (`_assertSessionInvariants` at every `_sessions` transition under `assert`, plus the injected clock);
+  the probe rule and the workspace ledger each have exactly one choke point; the limits live together
+  and are derived; and `AGENTS.md` now carries the rule this round's worst defect came from — a change
+  to a shared predicate, TTL, cap or sweep names every caller of it and what changes for each, and a
+  new call site for an existing rule gets the rule's state table, not its happy path.
+
+## Amendment (2026-10, slice 23): the file a peer cannot fetch is pushed to it
+
+The first two-device run of slice 18 — an Android emulator and the desktop app on the same machine —
+ended with a workspace holding one tiny HTML file, the desktop's card saying `1 个工作区文件未能应用`,
+and both sides calling the session a success. The emulator's own state named the cause:
+`peers/e4c81a….json` listed its three addresses as `2402:f000:9:4801:145c:543f:6fd:80c1`,
+`59.66.74.109` and `10.0.2.15` — the first two are *the desktop's own* WLAN IPv6 and IPv4 — the
+report read `success:true, workspaceFiles:0, workspaceFilesMissing:1`, the checkpoint for that peer
+had no `workspaceFiles` key at all, and the workspace's `files/` directory was there and empty. This
+slice is the fix, and it changes the wire (`kSyncProtocolVersion` 5 → 6).
+
+- **A peer can dial out and still not be dialled back.** Every file transfer in slices 18–22 was a
+  *pull* by the side that wanted the file, so a responder — always the side that did not start the
+  session — needed the initiator to be reachable at the address its connection arrived from. A NAT
+  rewrite makes that address the *forwarder's*: the Android emulator's user-mode network presents every
+  outbound connection as coming from the host, so the desktop's "where the peer connected from" was the
+  desktop's own LAN address and `_openReverseConnection` dialled **itself** (the certificate pin then
+  refused it, and the failure was swallowed). All three of the emulator's advertised addresses were
+  unusable from the desktop: two were the desktop's own, the third was the emulator's NAT address.
+  Nothing could move from the emulator to the desktop — not workspace files, not the blobs
+  `_unreachableBlobPull` marks pending — while the row half of the session worked perfectly, which is
+  why it read as success.
+- **Opening a session is not connecting.** `SyncClient.openSession` builds an `HttpClient` and a
+  session object and performs no I/O, so the old dial's `try`/`catch` could never observe a failure and
+  "no connection at all" was indistinguishable from "the peer refused this file": both counted as
+  `filesMissing`, and the first of the two was not even logged. The reverse dial now **pings** each
+  candidate before using it (that ping is also what makes a self-dial cheap: the pin refuses it in
+  milliseconds), and a `fetch == null` miss logs why.
+- **The push fallback (v6).** The initiator already holds a connection the pair has proved works, so
+  that is where a file the responder cannot fetch now travels. The responder's push acknowledgement
+  gained `workspaceRequests` — the pairs it planned and did not land, each with the version the
+  initiator advertised — and `/sync/wsfile` gained a `PUT` that receives one such file as its raw body
+  (the pair base64url in headers, a declared length, no content coding). The initiator pushes exactly
+  those files before its fetch beat, so the responder's own walk — taken while it answers that beat —
+  already sees them. A v5 peer would read the request list as "nothing owed" and had no reverse
+  connection to fetch over either, so the two sides would agree to disagree about a workspace's files
+  forever.
+- **The request set is the write authorization.** The responder accepts a push only for a pair this
+  session asked for — the set is built from the table the initiator itself advertised — and only for
+  the size that was asked for; an unrequested pair, a substituted version and a body longer than its
+  own declaration are all refused, and the pair leaves the set once it lands. Loopback and this
+  device's own addresses are still *tried* as candidates (another instance of this app on one machine
+  is a legitimate peer at 127.0.0.1, and the ping refuses a self-dial for free) but are never
+  *remembered*: the address a caller appears to connect from can be this device's own, and remembering
+  it is how the panel grew an endpoint that could only ever fail.
+- **The lander advances the entry — the fetcher was only ever the common case.** Slice 18 and slice 22
+  both said the side that *fetches* advances the ledger entry, because until now a fetch was the only
+  way a file could arrive. A pushed file arrives at the responder, after the beat that produced its
+  ledger, so the responder finalises the ledger once at the fetch beat: the push beat's ledger plus
+  every file the initiator pushed. The sender still never advances anything — it cannot know its bytes
+  arrived — and an entry the lander did not write asks for the same file for the life of the pairing.
+- **A miss a push repaired is not also reported as missing.** The responder counts a failed fetch as
+  `filesMissing` when it happens, and the push that repairs it arrives later; reporting both would put
+  "1 个工作区文件" and "1 个工作区文件未能应用" on one card. `_report` subtracts what the pushes
+  repaired, so what is left is what no direction moved.
+- **The hello now advertises where the initiator can be reached** (`candidateHosts`, beside
+  `listenPort`), which is what gives the reverse dial something to try after the observed address: the
+  pairing request has carried the same list since slice 9, and a session had no way to say it.
+- *Rejected: carrying the bytes in the fetch request.* The obvious one-message fix, and it makes every
+  `.dart_tool`-sized workspace a base64 blob inside a JSON control body. The `PUT` streams, which is
+  what the caps (2000 files / 200 MB) are sized for.
+- *Rejected: a relay, or requiring both peers to be dialable.* Nothing in the protocol needs a third
+  party to move a file that the peer holding it can already push.
+- *Rejected: keeping v5 compatibility ("no requests ⇒ old behaviour").* The old behaviour is exactly
+  the silent failure this slice exists to remove, and a half-spoken protocol is worse than an
+  honest refusal at hello.
+- *Known limits.* The blob plane still had only the reverse pull when this slice landed, so an
+  undiallable peer's attachments and skill bodies kept failing — closed by slice 24, with the same
+  shape and the skill-body coupling that shape brings. The push is sequential, and the
+  reverse dial now costs up to three connect budgets before it gives up and the fallback runs — paid
+  only in sessions that need the reverse direction at all.
+
+## Amendment (2026-10, slice 24): the blob a peer cannot fetch is pushed to it
+
+Slice 23 closed with its own limit written down: "the blob plane still has only the reverse pull, so an
+undiallable peer's attachments and skill bodies keep failing (the next slice, with the same shape)".
+The report that named the symptom is issue #1018, whose second half reads *"还会忽略消息中的图片，导致跨设备
+对话没法接续"*. Same cause one plane over: the rows of a conversation arrive, the picture they reference
+never does, and both sides call the session a success. This slice is the fix, and it changes the wire
+(`kSyncProtocolVersion` 6 → 7).
+
+- **The one face slice 23 left behind.** A blob was fetched only by the side that wanted it, so a
+  responder needed the initiator to be reachable at the address its connection arrived from — the same
+  NAT rewrite that made a workspace's HTML file unmovable made every image unmovable too.
+  `_unreachableBlobPull` marked the whole wanted set `failed`, the checkpoint carried it as
+  `pendingBlobs`, and the retry had exactly the same requirement next session, so for a NAT'd pair the
+  images never arrived at all. Images do live under the managed roots (`upload`, `images`), and the
+  manifest does find them (`kelivoFileUrisInRows`): this was never a discovery problem.
+- **The push fallback (v7).** The initiator already holds a connection the pair has proved works, so
+  that is where a blob the responder cannot fetch now travels. `SyncApplyAck` gained `blobRequests` —
+  the entries the responder planned and did not land, each with the hash the initiator advertised —
+  and `/sync/blob/<sha256>` gained a `PUT` that receives one of them: the entry's `kind` and its key
+  (base64url) in headers, the raw bytes as the body with a declared length. The initiator pushes them
+  after the workspace files and before its fetch beat, so the responder's own walk — taken while it
+  answers that beat — already describes what it holds.
+- **The request set is the write authorization, and the version is the request.** A push is accepted
+  only for a `(kind, key)` this session asked for, and only when the route's hash *is* that entry's
+  hash: a crafted target has never been advertised and can never be written, and the placement
+  allowlist still keeps even an advertised URI inside the managed roots. A file blob's declared length
+  must equal the size that was asked for, so a peer cannot substitute a different version for the one
+  it offered; a skill's zip has no length that could be agreed in advance (it is packed on demand),
+  so its guard is `applySkillBlob`'s own 200 MB cap and the transfer deadline. An entry leaves the set
+  once it lands, which is what makes a replayed body a refusal rather than a second write.
+- **The receiver verifies — in both directions now.** A file blob is hashed as it is placed and
+  compared with the requested digest; a skill body is extracted and its directory re-hashed before the
+  swap. That is exactly the authority the pull path already had on the *client* side, moved to the
+  side that writes bytes; the push route adds no new kind of trust, and a blob that fails either check
+  is simply still owed.
+- **The initiator serves only what it still backs.** Resolution goes through `handleFetchBlob` — the
+  same authority the `GET` route consults, including its fallbacks for a blob pending from an earlier
+  session — and a file blob is re-hashed on top of it (the hasher memoises by path, length and mtime,
+  so an unchanged file costs a stat). A file edited since its manifest is skipped with a log instead
+  of being pushed into a refusal, and the responder keeps it owed.
+- **A pushed skill body is paired with its record in the same session.** The push beat strips the
+  record of every skill whose body it could not verify, and a pushed body lands *after* that apply, so
+  the session would otherwise end with a directory and no row. That is not a harmless intermediate
+  state: `SkillsService`'s rescan adopts a row-less directory as a fresh record stamped *now*, which
+  then wins the next LWW merge and silently replaces the peer's skill settings with defaults. So the
+  write path applies that skill's rows from the same push and folds them into the payload the fetch
+  beat's checkpoint advance reads. The acknowledgement was already sent when this happens, so the
+  initiator keeps one stale skill-content baseline and re-offers the record next session; that session
+  finds the hashes equal, transfers nothing and converges.
+- **A list that is peer input has a bound.** `kMaxBlobRequestsPerSession` (2048) caps the ask. Every
+  entry costs the initiator more than a lookup — a hash it did not publish this session falls through
+  to the asset registry and to a full scan of the local skill directories — and the list is *truncated,
+  not refused*: what falls off stays in the responder's pending set and is asked for again. The
+  workspace request list needs no such bound, because a pair is a lookup in the table the peer itself
+  advertised and that table is already capped by its own walk.
+- *Rejected: carrying the blob bytes in the acknowledgement or the fetch request.* The one-message
+  fix, and it puts an `.dart_tool`-sized attachment inside a JSON control body; the `PUT` streams.
+- *Rejected: deferring the whole business apply to the fetch beat*, so a pushed body is present before
+  the record is written. It reorders an apply whose write fence, arrival gate and reporting are
+  load-bearing, to save applying one row late.
+- *Rejected: doing this for file blobs only.* The skill plane has the same shape and the same failure,
+  and the coupling above is the actual work of including it.
+- *Known limits.* A session killed between a pushed skill body landing and its record being applied
+  leaves a row-less directory for the next rescan to adopt — a window of milliseconds, and the only
+  state in which the rescan's default record can still win. A NAT'd first sync asks for at most
+  `kMaxBlobRequestsPerSession` blobs, so a large library converges over more than one session. A blob
+  has no byte cap beyond the skill zip's 200 MB: the pull path never had one either, and the bound on
+  both is the transfer deadline. And the reverse dial still costs up to three connect budgets before
+  the fallback runs, paid only in sessions that need the reverse direction at all.
+
+## Amendment (2026-10, slice 25): the round-3 review — nine findings, one choke point each
+
+An adversarial read of this branch (five traces over the long chains, plus probes that reproduced the
+two worst findings end to end) produced nine findings. All nine were real, and each is fixed at the
+rule it belongs to rather than at the symptom. Nothing here changes the wire: v7 stands, and the
+version gate is what makes that safe (see the last bullet).
+
+- **A workspace row's identity is written twice, and only one half was checked (Sev 5).** The `id`
+  column decides what the row *is*; the payload's own `id` is what `Workspace.fromJson` reads, and
+  therefore what the panel lists, what an update writes and what a delete removes. Only the column
+  was validated, so a paired peer — or an imported backup — could push a row whose column is a safe
+  `w-1` and whose payload names `..`: the panel showed an ordinary managed workspace called “Notes”,
+  and deleting it with the default “also delete files” built `<appData>/workspaces/..` and removed the
+  app data root — conversations, skills, sync state — recursively. `workspacePayloadNamesId` is now
+  the one rule (the payload names exactly the row's id, and that id is a safe path segment), read by
+  `_syncSkipsRow` — the choke point all six sync call sites already share — so a row whose halves
+  disagree is invisible in both directions. The provider refuses such a row on load as well (so no
+  unsafe id can reach the panel and no update can mint a second row under an id of the peer's
+  choosing), one unreadable payload now costs its own workspace rather than the whole list, and the
+  delete sink refuses a non-segment id on its own account. That last guard is unreachable today — the
+  load filter already stops the row — and is kept deliberately: it is the last place before the id
+  becomes a path.
+- **One serialized merge path for a peer record.** The record has two owners writing it at once (the
+  panel: a rename, an endpoint edit, the measured latency; a session: `lastSyncedAt`, `lastReport`,
+  the endpoint it promoted), and every one of them wrote the *whole* record from a copy it had read
+  earlier. The visible half was the worst: a successful session came back saying “Never synced”,
+  because `syncNow` hands the engine a peer object, the engine holds it for the session and writes the
+  outcome into it, while the session's own first state change makes the provider re-read `peers` from
+  disk — so the post-session probe write saved a *pre-session* snapshot over the outcome. Every
+  provider-driven session hit it, the manual button and each automatic round alike. `SyncStore.mutatePeer`
+  is now read-modify-write **inside** a per-peer section; eight whole-record writers became merges, and
+  `savePeer` remains only as the record's *origin* (a pairing answer is where a record begins).
+- **The blob-retry fold was implemented twice, with two different bodies.** The initiator folded
+  retries with `putIfAbsent` (“a superseded target is replaced by the fresh entry”); the responder's map
+  literal listed the retry set *last*, so the stale entry won the target key. A blob's target is
+  `(kind, key)`, so re-referencing an attachment keeps the target and changes the hash: the responder
+  asked, session after session, for the hash it had pending, the initiator skipped it as “no longer
+  backs”, and the picture never arrived while neither report named anything — the exact class slice 24
+  exists to fix. One `_foldBlobWanted(fresh, pending)` now serves both halves.
+- **The push beat had no “already taken” guard** while the fetch beat refused its half of the same
+  one-push-one-fetch rule. A replayed `/sync/subtrees` replaced the session's whole outcome — the state
+  the fetch beat and the report are built from — while the counters a landing books into kept
+  accumulating, over-reducing the report's misses and losing the first beat's landings.
+  `SyncRequestRefusal.pushAlreadyTaken()` (409) refuses it before the beat begins; the fetch beat still
+  belongs to the first push.
+- **The route-hash comparison was correct and its proof was wrong.** Slice 24 recorded it as an early
+  refusal with “no final-state proof — the digest check refuses the same bytes later”. It does not: the
+  digest is compared against the *route's* hash, so without this comparison a body hashing to some
+  other valid hash is written at the requested key and booked under the legitimate hash. The test now
+  sends exactly that, so the guard has a final-state proof instead of a note.
+- **A report that cannot say a file both arrived and is missing.** Three ways the workspace face could
+  tell the user something untrue: a conflict repaired by a *push* was never counted (`peerWins`
+  promises the discarded edit is counted, and the fetch half counted it while the fallback half did
+  not); a repaired miss was printed as missing (the summary part was gated on the raw miss count and
+  printed the reduced one, so the one card the fallback exists for read “workspace files pushed 1 (6 B)
+  · workspace files missing 0”); and a workspace dropped by the advertised-table cap was counted
+  nowhere, because the omission count only ever saw the snapshot's own `shared` flag. The request set
+  now carries which of its entries were `peerWins` (the plan knows the action, the request does not, and
+  the landing is where the edit is lost), the summary gates on what is left after the repair, and
+  `tablesOf` reports how many shared workspaces it dropped so both roles can name it.
+- **The fan-out budget was per call, and there is more than one call.** The tick fans out one full
+  round *per peer, concurrently*, and a session runs its own round when its snapshot is stale: two of
+  those stacked `2 × kSyncProbeConcurrency` probes on one listener whose own cap is
+  `kMaxPingsInFlight = kMaxPeerEndpoints + 2`, and the overflow answers `ping_busy` — correctly read as
+  “no verdict”, so the device disabled the measurement the fan-out was grown to support. One
+  device-wide pool (`_ProbePool`, sized `kSyncProbeConcurrency`) now hands out every probe of every
+  round, from either path, for every peer. A bigger constant could not have fixed it: nothing bounds the
+  number of paired peers, so no constant covers `P × 12`.
+- **A mixed round darkened the dot for a peer that had just answered.** A `ping_busy` arrives over the
+  *pinned* handshake, so the device at that address proved it is this peer and then declined to be
+  judged — stronger presence evidence than the silence of a remembered address beside it. The rule
+  suppressed the miss only when the whole round was no-verdict, so one silent memory turned a live
+  peer's full round into a miss, and two of those cleared the dot: `every` → `any`.
+- **A refused landing took the local copy with it.** `land` deleted the destination before checking the
+  staged bytes, so a refusal left the path empty — the version that was there was, at that moment, the
+  only copy this device had, and the next session re-fetched a file that was never lost. The size is
+  verified before the destination is touched; the post-rename stat stays as the belt for a writer that
+  lands in between. Reachability was, and remains, narrow (the sender re-stats and refuses a changed
+  file), which is why it was recorded as a lead rather than a finding — but the repair is a reorder.
+- **The one guess a round that proved nothing spends went to the memory's head.** The freshness rule
+  keeps a minute-old figure from *ordering* the dial, but the address that figure names is not a bad
+  bet. The unfiltered snapshot is now kept beside the filtered one on the round, and the single guess
+  prefers the first candidate that has ever answered, falling back to the head. Order is preserved
+  inside each half, so topology still breaks the tie, and a *fresh* answered address is in `dialable`,
+  so this never overrides fresh evidence.
+- *Rejected: a bigger `kMaxPingsInFlight`.* It cannot be derived for an unbounded peer count, and the
+  property the file claims is about the *device*, not about one round.
+- *Rejected: probing again when the snapshot is partly stale.* It adds probe traffic inside a
+  user-visible session, breaks the “one wave” property, and voids the meaning of the freshness test.
+  The one guess covers the case for one connect budget instead.
+- *Rejected: carrying the `peerWins` action on the wire.* The initiator does not care whether its push
+  replaces the peer's edit; the flag is the receiving side's own bookkeeping, so it stays off the wire.
+- *Rejected: capability negotiation instead of the strict version gate* — the gate is exactly what
+  removes the need for version-shaped guards, and it is why the leniency left in the parsers is
+  input-hardening rather than compatibility (see the next bullet).
+- **No compat guards, and the leniency that remains is not one.** There is exactly one version check in
+  the sync code — the hello gate, exact equality — and no code path anywhere branches on a version.
+  The lenient parses (`tryParse` dropping a bad blob entry, the request list truncated at
+  `kMaxBlobRequestsPerSession`, defaults for absent batch fields) guard against a peer that is
+  *dishonest or broken*, which the gate cannot rule out: it proves the peer is v7, not that it is
+  correct, and a proxy, a truncated body or a corrupt row produce the same shapes with no version skew
+  at all.
+- *Known limits.* The delete sink's segment check and the second-push refusal are both
+  unreachable-by-construction today (Occ 1: no shipped client double-pushes, and the load filter
+  already stops a bad id) — kept because each is the last word at its own boundary, and named here so
+  nobody counts them as proven by a test they do not have. A workspace whose file entries exceed the
+  advertised-table cap still syncs nothing for that session; it is now *named* on the card rather than
+  silent, and raising the cap remains a product decision. And the probe pool serialises two peers'
+  rounds instead of stacking them, so a tick over many peers takes longer in wall-clock than it did —
+  bounded by `kSyncProbeConcurrency` per wave, and the alternative was a listener refusing its own
+  device's questions.
+
+## Amendment (2026-10, slice 26): the addendum review — five findings, and two boundaries named
+
+A second adversarial pass over the same branch (two delegated traces plus a source read) produced five
+more findings after slice 25. All five were real and are fixed here, again at the rule each belongs
+to; the wire does not change (v7 stands). The same pass confirmed two *acceptance boundaries* rather
+than defects, recorded at the end.
+
+- **A re-pair dropped the name and history of every address it re-advertised (Sev 3/Occ 4).** Pairing
+  lands the address it came in on and every advertised candidate *before* it merges the previous
+  record's endpoints, and `rememberEndpointHistory` skipped a collision
+  (`if (endpointFor(host, port) != null) continue;`). The skipped addresses are the ones that matter:
+  the address the pair is on today is usually a network it has synced over before, so a re-scan at
+  home erased the home tile's name, session count and probe measurement, while an address from a
+  network the pair had *left* kept them. The merge now folds the old tile's facts into the fresh copy
+  — the name, the earlier first-learned, the later session and probe stamps with the measurement that
+  belongs to them, and the session count *added* (the old count precedes the re-pair; the fresh one is
+  this pairing) — while the fresh copy keeps its position, because that position is the dial order the
+  call exists to build.
+- **The push window was not a beat, so a long upload was swept (Sev 3/Occ 3).** The idle sweep keeps a
+  session with a beat in flight and drops one whose last beat is older than `kSessionIdleTtl` (two
+  minutes). Hello, push and fetch were beats; the file and blob bodies between the push ack and the
+  fetch were not — the put routes neither opened a beat nor stamped `lastBeatAt`. A first sync whose
+  upload phase outlasted the window was therefore swept by this device's own next round (the sweep runs
+  *before* `syncWithPeer`'s busy refusal), after which every remaining put found no session and the
+  fetch beat threw `sessionMissing`. Each put is a beat now: the body streams with `beatsInFlight > 0`,
+  so no sweep can take the session mid-transfer, and both ends of the beat refresh the stamp, so a
+  continuous upload stays fresh while a genuinely silent one still expires.
+- **A limit another limit depends on was restated, and its named proof did not exist (Sev 2/Occ 3).**
+  `kMaxWorkspaceLedgerEntries` (20,000) exists because it is ten workspaces at `kMaxWorkspaceFiles`
+  (2,000); the doc said so in prose and named `sync_limits_test.dart` as the proof, and no such file
+  existed. Both caps now live in `sync_limits.dart` and the ledger cap is *computed*
+  (`10 * kMaxWorkspaceFiles`), so raising the file cap raises it; the named test exists and asserts the
+  relationships rather than the numbers (ledger over file cap, listener headroom over the endpoint cap,
+  probe budget equal to it, reverse-dial budget within it). Values are unchanged.
+- **A port the store refuses was silently discarded (Sev 2/Occ 2).** The address form popped on
+  anything `int.tryParse` accepted, while the store refuses `port <= 0` (`SyncEndpointAdd.invalid`),
+  and the field has no input formatter — so `0`, `-1` or `70000` from a desktop keyboard closed the
+  sheet and then wrote nothing: `addPeerEndpoint` returned `invalid`, `mutatePeer` saw `false`, and the
+  only l10n mapping of the enum is `full`. On the edit path the sheet simply showed the old address
+  again, so the repair silently did not happen. The form checks 1..65535 and stays open, which makes
+  that silent state unreachable from the UI; `duplicate` remains the documented no-op, and the store's
+  guard remains the wire-level one.
+- **A doc block was two documents fused into one (Sev 1/Occ 2).** `panelOpened`'s doc and
+  `workspaceSummaries`' doc sat in one block with no blank line between them, so the field carried the
+  method's doc and the method carried none. Split.
+
+Boundaries this pass confirmed and did **not** change — recorded so the claim "every workspace face
+applies the rule" is not read as stronger than it is:
+
+- **The versioned-backup merge is the one workspace writer outside the choke points.** It copies
+  `kind IN ('workspace', 'skill', 'composerPublishedFile')` rows verbatim from an attached backup with
+  none of the three predicates (the id check, the linked-row exclusion, the payload-names-id
+  agreement). It is reached only after `sanitizeDatabase` → `BackupPortability.portable` dropped linked
+  rows and stripped `hostPath`, and every downstream face filters a half-disagreeing row, so no path
+  from it to a filesystem write was found. It is an acceptance boundary, not a defect with a symptom.
+- **A non-workspace kind may still reference a linked workspace id.** A synced `mcpServer` row's
+  `workspaceId` is resolved by `WorkspaceProvider.byId` — which applies the payload/id agreement but
+  not `isLinkedWorkspace` — and turned into a read-write mount. Assistant `defaultWorkspaceId` and
+  conversation extras are the same shape (scrubbed for backups, not on the wire). This is pre-existing
+  on `master` (mcp rows sync there too) and outside this branch's diff; the peer must first *learn* the
+  UUID, and conversation extras do carry ids and do sync. It needs a product decision — whether a peer
+  may bind an MCP server to this device's linked external folder — rather than a silent fix here.
+
 ## Considered options (rejected)
 
 - **Whole-database / backup-zip exchange** — not version-portable; a newer schema on an
@@ -1094,8 +1834,37 @@ gate and the suppressor may read.
   revocation.
 - **Hybrid logical clocks in v1** — requires touching every `updated_at` bump path in
   upstream repository code; skew is surfaced in the report instead.
-- **Workspace sync** — managed workspaces are unbounded local project directories; linked
-  workspaces are host paths by definition.
+- **Workspace sync** — *overturned by slice 18*: managed workspaces are unbounded local project
+  directories and linked ones are host paths, so the blanket rule was right about the *kind* and
+  wrong as a rule — the restriction belongs per row (linked never travels) and per face (a managed
+  directory travels under caps, a prune list and an unreadable-index guard).
+- **Content hashing for workspace files** — reads every byte to answer what mtime answers, which
+  is the expensive half of the "avoid a catastrophic walk" requirement (slice 18).
+- **Directory-level LWW for workspaces** — one edited file would move a whole tree, and a conflict
+  would discard a directory rather than a file (slice 18).
+- **Seeding workspace content only on the first sync** — cheapest to build, and the only variant
+  with no way back: after the first session the two copies drift with nothing left to detect it
+  (slice 18).
+- **Folding a workspace content digest into the row digest** (the skill precedent) — the face
+  already re-lists every workspace's files each session, so content needs no trigger; mixing it in
+  would make a file edit look like a row edit, adding a row transfer and a fabricated LWW loss per
+  edit (slice 18).
+- **A switch that overrides the workspace caps** — the requirement was to avoid a catastrophic walk
+  and transfer, so a switch that re-enables both is that requirement with an off button; the
+  tooltip says the record still travels and the switch only controls files (slice 18).
+- **A separate workspace ledger file per peer** — the ledger is one pair's state advanced by one
+  session and written at one moment; inside the checkpoint, `deletePeer` and `resetCheckpoints()`
+  already cover it, and a ledger that outlived a restore would delete the peer's files (slice 18).
+- **Capability negotiation instead of a protocol bump** — a "does the peer do this?" handshake
+  multiplies the half-synced combinations to reason about (which is the failure mode it would
+  create) for a one-time upgrade cost a strict version gate pays once (slice 18, protocol v5).
+- **A bare-TCP probe as the dot's evidence** — it answers while every session fails, which is the
+  one thing the dot must never do (slice 19).
+- **Replacing the whole endpoint set from the repair dialog** — asks the user to retype the
+  addresses the app already remembers, in order to fix the one that failed (slice 19).
+- **Racing TLS handshakes at dial time** (happy-eyeballs across candidates, first winner taken) —
+  the probe already buys the same evidence once per tick, the aborted legs need accept-loop
+  hardening, and the case it wins is narrow (slice 20).
 - **Byte-verifying a skill zip against its entry hash** — the entry hash is the *directory*
   hash (that is what makes content edits visible to the row plan), so verifying the zip bytes
   against it rejects every honest transfer. Structural extraction plus a re-hash of the staged
@@ -1173,16 +1942,36 @@ gate and the suppressor may read.
   blocks a conversation.
 - Serving a skill body costs one zip build per content hash and launch (cached under
   `<skills>/.sync-blob-cache`), and directory hashing is memoised per launch by fingerprint.
-- An address a peer has moved away from costs one failed connect before the remembered set moves on
-  to the one that answers; `unreachable` on the panel therefore means *no* remembered address
-  answered — the peer is off, or it is on a network this pair has never met, where re-scanning its
-  QR or typing the address remains the repair. Without discovery nothing anticipates a change, so
-  the panel still shows the last attempt — and since slice 14 it also shows whether any remembered
-  address answers a probe right now, which is a claim about the addresses rather than about the
-  peer.
-- A foreground round over an unreachable peer walks its remembered candidates instead of stopping
-  at the first: the cost is one connect timeout per candidate, bounded by the six-endpoint cap, and
-  the one-minute throttle keeps that from becoming a loop.
+- An address a peer has moved away from is found by the probe rather than by a failed session: the
+  ten-second tick (and the full round every evidence-changing moment triggers) asks the remembered
+  set in parallel, so the address that answers becomes the new head without a connect timeout being
+  spent on the ones that do not. Since slice 19 that probe is also an authenticated request, so the
+  panel's claim is about the *pair* — reachable and still paired — rather than about the addresses
+  alone, which is what the bare-TCP version could never say.
+- Since slice 20 an unreachable peer costs **one** connect attempt, not one per remembered address:
+  the dial spends the probe's answer and, when the probe reached nothing at all, spends a single
+  guess on the best-remembered address. The corollary is a known limit: an address the probe cannot
+  reach — its SYN is filtered, or it needs the longer hello budget to wake — is not tried at dial
+  time unless nothing else was proved, so the remedy for that shape stays the documented drift
+  repair (re-scan the QR, or edit the address on the card) and the next tick probes again.
+- Workspace content inherits the mtime family's limits: a FAT/exFAT volume's two-second timestamp
+  granularity, a clock more than five minutes off (the same yellow flag the rows raise), and two
+  edits that leave both size and mtime identical are invisible to the file table. A rename reads as
+  a delete plus a create, so a renamed large file is re-sent whole; permission bits, symlinks and
+  empty directories do not travel.
+- Workspace caps are not escapable and are the panel's own business: over 2,000 files or 200 MB a
+  workspace syncs no content at all (its row and its size are shown as a lower bound), and the
+  twenty-thousand-entry ledger cap drops whole workspaces back to conservative re-sending rather
+  than to deleting. A workspace whose index could not be read contributes nothing that round — no
+  table, no deletions, `无法读取` on the panel — which is the price of never being able to mistake an
+  unreadable file for a deleted one.
+- Linked workspaces are absent from the panel's workspace section (they have no content to sync, so
+  a permanently-off switch would be noise): a user with three workspaces and two rows is seeing the
+  one kind of workspace the panel cannot do anything about, and the difference is documented rather
+  than explained in prose on the panel.
+- A workspace record removed by sync takes its directory with it, so a peer's deletion is not
+  visible-only: the disk is reclaimed too, which also means a workspace deleted on one device
+  cannot be recovered from the other one's directory.
 - Scanner availability follows the platform, not the package: `mobile_scanner` has Android and
   iOS implementations wired here, so desktop devices show a QR and pair by typing the code (the
   port field is prefilled with the preferred port). macOS is deliberately excluded even though
