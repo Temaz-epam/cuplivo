@@ -10,7 +10,7 @@ import 'package:flutter/foundation.dart'
 ///
 /// A link is a pointer, not a copy: it resolves only where the conversation
 /// exists — the install that copied it, or a device LAN sync carried it to
-/// (merged rows keep their ids). The same URL crosses the iOS bridge whole, so
+/// (merged rows keep their ids). The same URL crosses the mobile bridges whole, so
 /// the Live Activity widget's id and a copied link are read by one grammar.
 class ConversationLink {
   const ConversationLink({required this.conversationId, this.messageId});
@@ -26,12 +26,14 @@ class ConversationLink {
   final String? messageId;
 
   /// True where the OS has this scheme registered, i.e. where a link this app
-  /// copies actually opens this app when the user taps it. Enabling another
-  /// platform means registering the scheme *and* adding it here:
-  /// Android `AndroidManifest.xml`, macOS `Runner/Info.plist`, the Windows
-  /// installer's registry entry, Linux's `.desktop` MimeType. iOS registers
-  /// `cuplivo` in `ios/Runner/Info.plist`.
-  static bool get osRegistered => defaultTargetPlatform == TargetPlatform.iOS;
+  /// copies actually opens this app when the user taps it. Android registers
+  /// `cuplivo` in `AndroidManifest.xml` and iOS in `ios/Runner/Info.plist`;
+  /// enabling another platform means registering the scheme *and* adding it
+  /// here (macOS `Runner/Info.plist`, the Windows installer's registry entry,
+  /// Linux's `.desktop` MimeType).
+  static bool get osRegistered =>
+      defaultTargetPlatform == TargetPlatform.iOS ||
+      defaultTargetPlatform == TargetPlatform.android;
 
   /// The canonical string a user copies. Encoded with [Uri.encodeComponent] so
   /// no id can introduce a path separator or a second parameter.
