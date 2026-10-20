@@ -386,9 +386,11 @@ void main() {
     );
 
     final uploadDir = Directory('${appSupportDir.path}/upload');
-    final existingPaths = await tester.runAsync(
-      () => uploadDir.list().map((entry) => entry.path).toSet(),
-    );
+    final existingPaths =
+        await tester.runAsync(
+          () => uploadDir.list().map((entry) => entry.path).toSet(),
+        ) ??
+        <String>{};
 
     final disposeGate = Completer<void>();
     fakePathProvider.appDataGate = disposeGate;
@@ -422,12 +424,38 @@ void main() {
     expect(
       mediaController.debugTextPasteWriteSettled,
       isTrue,
-      reason: 'the superseded long paste must release its file',
+      reason: 'the superseded long paste must settle at all',
     );
-    final remainingPaths = await tester.runAsync(
-      () => uploadDir.list().map((entry) => entry.path).toSet(),
+    // Then wait for the *invariant*, not for one instant after the flag: the
+    // flag says every paste finished writing, while the directory is the thing
+    // this test is about, and on CI the two are not ordered tightly enough to
+    // read the directory once (a red run there reported the settled flag with the
+    // third `pasted_*.txt` still listed). Polling cannot hide the leak the test
+    // exists for - a paste that never releases its file still fails, and it
+    // fails below with the file named.
+    final deadline = DateTime.now().add(const Duration(seconds: 10));
+    var remainingPaths = existingPaths;
+    while (true) {
+      remainingPaths =
+          await tester.runAsync(
+            () => uploadDir.list().map((entry) => entry.path).toSet(),
+          ) ??
+          remainingPaths;
+      if (remainingPaths.length == existingPaths.length &&
+          remainingPaths.containsAll(existingPaths)) {
+        break;
+      }
+      if (DateTime.now().isAfter(deadline)) break;
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 20)),
+      );
+      await tester.pump(const Duration(milliseconds: 20));
+    }
+    expect(
+      remainingPaths,
+      existingPaths,
+      reason: 'a superseded long paste must release its file',
     );
-    expect(remainingPaths, existingPaths);
 
     controller.dispose();
     focusNode.dispose();
