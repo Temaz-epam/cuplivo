@@ -3,6 +3,7 @@ import 'package:uuid/uuid.dart';
 
 import '../../utils/utf16_safe_cut.dart';
 import 'message_part.dart';
+import 'message_quote.dart';
 import 'token_usage.dart';
 import '../database/generation_run.dart';
 
@@ -143,6 +144,15 @@ class ChatMessage extends HiveObject {
   /// Latest API request only; the scalar token fields contain the whole turn.
   final TokenUsage? finishUsage;
 
+  /// Citation of the message this one replies to (docs/adr/0012), or null when
+  /// this message is not a reply.
+  ///
+  /// Only a user-originated message carries one, it is set when the message is
+  /// created, and it is part of the message's content identity: a new version
+  /// of this row carries the same citation. [copyWith] therefore never clears
+  /// it — there is no flow that removes a reply from a message that has one.
+  final MessageQuote? quote;
+
   TokenUsage get tokenUsage => TokenUsage(
     promptTokens: promptTokens,
     completionTokens: completionTokens,
@@ -178,6 +188,7 @@ class ChatMessage extends HiveObject {
     this.reasoningTokens,
     this.cacheWriteTokens,
     this.finishUsage,
+    this.quote,
   }) : _parts = List<MessagePart>.unmodifiable(
          parts ?? <MessagePart>[TextPart(content ?? '')],
        ),
@@ -334,6 +345,7 @@ class ChatMessage extends HiveObject {
     int? reasoningTokens,
     int? cacheWriteTokens,
     TokenUsage? finishUsage,
+    MessageQuote? quote,
   }) {
     final List<MessagePart>? nextParts;
     if (parts != null) {
@@ -369,6 +381,7 @@ class ChatMessage extends HiveObject {
         reasoningTokens: reasoningTokens ?? this.reasoningTokens,
         cacheWriteTokens: cacheWriteTokens ?? this.cacheWriteTokens,
         finishUsage: finishUsage ?? this.finishUsage,
+        quote: quote ?? this.quote,
       )
       .._storageOrder = (id == null || id == this.id) ? _storageOrder : null
       .._generationState = (id == null || id == this.id)
@@ -412,6 +425,7 @@ class ChatMessage extends HiveObject {
       'reasoningTokens': reasoningTokens,
       'cacheWriteTokens': cacheWriteTokens,
       if (finishUsage != null) 'finishUsage': finishUsage!.toJson(),
+      if (quote != null) 'quote': quote!.toJson(),
     };
   }
 
@@ -473,6 +487,7 @@ class ChatMessage extends HiveObject {
               Map<String, dynamic>.from(json['finishUsage'] as Map),
             )
           : null,
+      quote: MessageQuote.tryParse(json['quote']),
     );
   }
 }

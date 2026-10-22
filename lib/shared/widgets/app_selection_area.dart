@@ -14,6 +14,7 @@ import 'package:markstream/markstream.dart'
         MarkstreamSelectionController,
         MarkstreamSelectionScope,
         MarkstreamCopyLimitException;
+import '../../features/chat/utils/selection_markdown_memory.dart';
 import '../../l10n/app_localizations.dart';
 
 /// App-owned selection actions shared by messages and Markdown previews.
@@ -23,6 +24,8 @@ class AppSelectionArea extends StatefulWidget {
     required this.child,
     this.clipboardWriter,
     this.copyByteLimit,
+    this.messageId,
+    this.onReplySelection,
   });
 
   final Widget child;
@@ -30,6 +33,19 @@ class AppSelectionArea extends StatefulWidget {
 
   /// Optional budget for source and plain-text previews without AST projections.
   final int? copyByteLimit;
+
+  /// The message this surface renders, when it renders one.
+  ///
+  /// Recorded with every selection so a reply can cite the message the
+  /// selection came from, and so the hotkey knows what to reply to. Surfaces
+  /// that render text outside a message (a preview, an export sheet) leave it
+  /// `null` and record nothing.
+  final String? messageId;
+
+  /// Offers "Reply" beside the platform Copy, receiving the selection as
+  /// markdown. Only a chat bubble passes one.
+  final ValueChanged<String>? onReplySelection;
+>>>>>>> 1d8d78971 (feat(reply): a message reply carries a quote citation, on markstream's selection (#1027))
 
   @override
   State<AppSelectionArea> createState() => _AppSelectionAreaState();
@@ -139,6 +155,11 @@ class _AppSelectionAreaState extends State<AppSelectionArea> {
   Widget _buildMenu(BuildContext context, SelectableRegionState region) {
     final text = _selectedText;
     final anchors = region.contextMenuAnchors;
+    // Read the recording, not the live controller: by the time the menu is
+    // built the framework may already have collapsed the selection.
+    final replyMarkdown = widget.onReplySelection == null
+        ? null
+        : SelectionMarkdownMemory.instance.markdownIfOwner(this);
     return AppTextSelectionToolbar(
       anchors: anchors,
       selectionContext: region.context,
@@ -170,6 +191,14 @@ class _AppSelectionAreaState extends State<AppSelectionArea> {
               region.hideToolbar();
             },
           ),
+        if (replyMarkdown != null && replyMarkdown.trim().isNotEmpty)
+          ContextMenuButtonItem(
+            label: AppLocalizations.of(context)!.chatMessageWidgetReplySelection,
+            onPressed: () {
+              region.hideToolbar();
+              widget.onReplySelection!(replyMarkdown);
+            },
+          ),
         if (_markdownSelection.hasSelection)
           ContextMenuButtonItem(
             label: AppLocalizations.of(context)!.markdownCopyRichTextAction,
@@ -189,8 +218,29 @@ class _AppSelectionAreaState extends State<AppSelectionArea> {
     );
   }
 
+  /// Keeps the selection as plain text for the Translate item, and — on a
+  /// surface that renders a message — records it, so "Reply" and the desktop
+  /// hotkeys can still act on it after the framework drops the live selection.
+  void _recordSelection() {
+    final messageId = widget.messageId;
+    if (messageId == null) return;
+    final selections = _markdownSelection.selections;
+    if (selections.isEmpty) {
+      SelectionMarkdownMemory.instance.clearIfOwner(this);
+      return;
+    }
+    SelectionMarkdownMemory.instance.capture(
+      owner: this,
+      messageId: messageId,
+      content: [
+        for (final selection in selections) selection.content,
+      ],
+    );
+  }
+
   @override
   void dispose() {
+    SelectionMarkdownMemory.instance.clearIfOwner(this);
     _ownedMarkdownSelection.dispose();
     _regionFocus.dispose();
     super.dispose();
@@ -206,8 +256,10 @@ class _AppSelectionAreaState extends State<AppSelectionArea> {
         actions: {CopySelectionTextIntent: _copyAction},
         child: SelectionArea(
           focusNode: _regionFocus,
-          onSelectionChanged: (content) =>
-              _selectedText = content?.plainText ?? '',
+          onSelectionChanged: (content) {
+            _selectedText = content?.plainText ?? '';
+            _recordSelection();
+          },
           contextMenuBuilder: _buildMenu,
           child: SelectionScrollContainer(
             key: _selectionKey,
