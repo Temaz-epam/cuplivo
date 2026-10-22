@@ -38,8 +38,8 @@ import '../../provider/widgets/provider_balance_badge.dart';
 import '../../provider/widgets/provider_avatar.dart';
 import '../../../utils/model_grouping.dart';
 import '../../../theme/app_font_weights.dart';
-import 'package:Kelivo/theme/app_semantic_colors.dart';
-import 'package:Kelivo/shared/widgets/section_card.dart';
+import 'package:Cuplivo/theme/app_semantic_colors.dart';
+import 'package:Cuplivo/shared/widgets/section_card.dart';
 
 class ProviderDetailPage extends StatefulWidget {
   const ProviderDetailPage({
@@ -817,7 +817,7 @@ class _ProviderDetailPageState extends State<ProviderDetailPage> {
         // Top iOS-style section card for key settings
         SectionCard(
           children: [
-            if (widget.keyName.toLowerCase() != 'kelivoin')
+            if (widget.keyName.toLowerCase() != 'cuplivoin')
               _providerKindRow(context),
             _providerGroupRow(context, groupName: groupName),
             _iosRow(
@@ -1073,12 +1073,12 @@ class _ProviderDetailPageState extends State<ProviderDetailPage> {
           label: l10n.providerDetailPageNameLabel,
           controller: _nameCtrl,
           hint: widget.displayName,
-          enabled: widget.keyName.toLowerCase() != 'kelivoin',
+          enabled: widget.keyName.toLowerCase() != 'cuplivoin',
           onChanged: (_) => _save(),
         ),
         const SizedBox(height: 12),
         if (!(_kind == ProviderKind.google && _vertexAI)) ...[
-          if (widget.keyName.toLowerCase() != 'kelivoin' &&
+          if (widget.keyName.toLowerCase() != 'cuplivoin' &&
               !_multiKeyEnabled) ...[
             _inputRow(
               context,
@@ -1109,12 +1109,12 @@ class _ProviderDetailPageState extends State<ProviderDetailPage> {
               widget.keyName,
               displayName: widget.displayName,
             ).baseUrl,
-            enabled: widget.keyName.toLowerCase() != 'kelivoin',
+            enabled: widget.keyName.toLowerCase() != 'cuplivoin',
             onChanged: (_) => _save(),
           ),
         ],
         if (_kind == ProviderKind.openai &&
-            widget.keyName.toLowerCase() != 'kelivoin' &&
+            widget.keyName.toLowerCase() != 'cuplivoin' &&
             !_useResp) ...[
           const SizedBox(height: 12),
           _inputRow(

@@ -231,7 +231,7 @@ class NativeBrowserEngine implements BrowserEngine {
     // each WebView scroll frame.
     useHybridComposition: _usesHybridComposition,
     javaScriptEnabled: true,
-    resourceCustomSchemes: const ['kelivo'],
+    resourceCustomSchemes: const ['cuplivo'],
     webViewAssetLoader: _workspaceLoader,
     useShouldOverrideUrlLoading: true,
     useOnDownloadStart: true,
@@ -1118,7 +1118,7 @@ class NativeBrowserEngine implements BrowserEngine {
     final uri = Uri.tryParse(request.url.toString());
     if (scope == null ||
         uri == null ||
-        uri.scheme != 'kelivo' ||
+        uri.scheme != 'cuplivo' ||
         !scope.owns(uri) ||
         request.method != 'GET') {
       return null;

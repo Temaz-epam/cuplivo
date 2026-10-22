@@ -1,5 +1,5 @@
-import 'package:Kelivo/shared/widgets/app_selection_area.dart';
-import 'package:Kelivo/features/intelligent_ui/catalog/ui_budgets.dart';
+import 'package:Cuplivo/shared/widgets/app_selection_area.dart';
+import 'package:Cuplivo/features/intelligent_ui/catalog/ui_budgets.dart';
 import '../features/intelligent_ui/widgets/genui_clipboard.dart';
 import '../shared/widgets/ios_tactile.dart';
 import '../features/intelligent_ui/host/ui_copy_actions.dart';
@@ -9,7 +9,7 @@ import '../l10n/app_localizations.dart';
 import '../icons/lucide_adapter.dart';
 
 import '../theme/app_font_weights.dart';
-import 'package:Kelivo/theme/app_semantic_colors.dart';
+import 'package:Cuplivo/theme/app_semantic_colors.dart';
 
 Future<void> showSelectCopyDesktopDialog(
   BuildContext context, {

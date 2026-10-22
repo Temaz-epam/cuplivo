@@ -1,5 +1,5 @@
-import 'package:Kelivo/utils/protected_text.dart';
-import 'package:Kelivo/core/models/message_part.dart';
+import 'package:Cuplivo/utils/protected_text.dart';
+import 'package:Cuplivo/core/models/message_part.dart';
 import 'package:markstream/markstream_core.dart';
 
 /// Original coordinates precede thinking extraction, visual regexes and bubbles.

@@ -1,5 +1,5 @@
 import 'composer_draft.dart' show DraftSubmission;
-import 'package:Kelivo/features/intelligent_ui/models/ui_context_attachment.dart';
+import 'package:Cuplivo/features/intelligent_ui/models/ui_context_attachment.dart';
 
 class DocumentAttachment {
   final String path; // absolute file path

@@ -1,4 +1,4 @@
-import 'package:Kelivo/utils/protected_text.dart';
+import 'package:Cuplivo/utils/protected_text.dart';
 import 'package:markstream/markstream_core.dart' show SourceSpan;
 import 'dart:convert';
 
