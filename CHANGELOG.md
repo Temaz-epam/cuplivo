@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [4.4.0] - 2026-10-27
 
 ### Added
 
@@ -16,6 +16,12 @@
 
 ### Changed
 
+- **Re-based on Kelivo `master` at `b1702b3a9`** (Flutter 3.47.6): the whole Cuplivo feature set is
+  re-implemented on that baseline rather than ported forward, so this release also carries every
+  upstream change since Kelivo `v1.3.1` — the screenshot-golden suites are gone and the Linux browser
+  checks are fixed, the data directory can be moved to another folder on Windows, iOS drops the legacy
+  glass harness for the platform's own blur, and the Live Activity extension follows the app's build
+  version instead of naming its own
 - **LAN sync protocol v8**: both devices must be updated — a mismatched pair pauses syncing until they are. The deletion announcement now carries the conversation row's clock beside the digest, and the plan's own delete branch reads that clock too, which is what lets a conversation restored from the recycle bin survive the next session instead of being deleted again — on either device
 - **Deleting a conversation no longer decodes it on the delete's own path**: the capture is still taken inside the delete's transaction, so what is staged is exactly what the cascade is about to remove, but decoding it and writing the bin entry now happen after that transaction closes. A 1 MB conversation used to add 37–56 ms to its own delete; it now adds about 8 ms, of which the capture query is most of it
 - **The online dot and the connect beat are more honest**: the probe behind the dot is now an authenticated request (reachable *and* still paired), and the dial only tries the addresses that probe reached. A sleeping peer costs one connect attempt instead of one per remembered address, and the "connecting… (2/3)" candidate counter is gone
