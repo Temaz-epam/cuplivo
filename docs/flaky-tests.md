@@ -770,9 +770,10 @@ to ask that service's platform rule before it runs, or the CI's operating system
 untested input.
 
 
-## 13. The `a02ee457a` baseline: genui fixtures and the browser engine are Windows-host failures
+## 13. The `a02ee457a`..`3924a5d0e` baselines: genui fixtures and the browser engine are Windows-host failures
 
-The replay onto `a02ee457a` (2026-10-25) brought two upstream feature lines that this machine had
+The replay onto `a02ee457a` (2026-10-25), finished on `3924a5d0e` when upstream advanced again
+while the gates were running, brought two upstream feature lines that this machine had
 never run: the generated-UI component set with its golden fixtures, and the embedded browser's
 native engine. Both are green on CI (`ubuntu-24.04`) and red here, and neither is a Cuplivo change -
 the control runs below are what says so.
@@ -803,3 +804,66 @@ the version (upstream's `1.3.1+80` had overwritten `4.3.0+6`) and `assets/app_ic
 the desktop tray, both About pages and `test/desktop/app_mark_assets_test.dart` need declared. That
 test loads the mark through `rootBundle`, so a dropped asset line fails it at runtime rather than at
 compile time - see the record in `docs/rebase-runbook.md`.
+
+
+## 14. The `4671dbe48` baseline: upstream retired the golden layer, and two Windows-host failures joined the list
+
+Upstream advanced again while this pass's gates were running, and one of the six commits
+`3924a5d0e..4671dbe48` changes what this file has to say: `ccd0815e9` ("test: remove screenshot
+goldens and fix Linux browser checks") **deletes** `test/goldens/` — the nine golden test files and
+all their PNG baselines. 259 of this file's registry entries named cases in those files.
+
+Dropping them is not a lost registration; it is the same conclusion reached at the source. Those
+entries existed because a pixel fixture generated on `ubuntu-24.04` cannot be compared against this
+machine's Skia, and a fixture that fails everywhere was never generated where it runs. Upstream's
+answer is to stop comparing pixels across platforms; the registry's answer was one entry per case.
+With the suites gone there is nothing left for the fragmented answer to name, so the 259 entries were
+retired in this pass — a registry entry is a claim about a test that exists, and `flutter test` cannot
+fail a file that is not in the tree.
+
+What survives, unchanged and re-proved in a control worktree at `05506b840`, is the embedded browser
+engine (63 of 64 cases, `UnimplementedError: addDevToolsProtocolListener ...` — see §13), plus the four
+case names the local registry cannot key. Two cases joined the list in this pass, each proved the same
+way — a control run at upstream's own tip, same file, same assertion:
+
+| test | how it fails on Windows | control at `05506b840` |
+|---|---|---|
+| `storage_image_usage_test.dart` › classifies rendered Markdown images without treating code samples as uses | `Expected: StorageImageKind:<StorageImageKind.chat> Actual: <null>`, reason `inline-code.png`. The classifier keeps *resolved* reference paths in a `Set<String>` while the listing hands back the on-disk spelling, so on a case-insensitive filesystem one file can occupy two spellings and the chat-use lookup misses. Upstream runs that suite on Linux only. | identical failure |
+| `browser_page_card_test.dart` › completed preview loads its saved file while the next group stays live | `PathAccessException: Deletion failed, path = ...browser_card_snapshot_<hash> (errno = 32)` from the test's own teardown at line 414: the preview's read handle is released after the test deletes its snapshot directory, which Windows refuses while a handle is open (`Linux` unlinks it happily). | identical failure |
+
+Both are the platform's, not the merge's: neither file has a Cuplivo commit in it, and both fail at a
+tip that has none of our code. The registry therefore stands at **70 entries** — 68 browser-engine
+cases and these two — down from 320, and the drop is upstream's, not a cleanup.
+
+
+## 15. The sync suite's panel cases never settle, and cost ten minutes each
+
+`test/core/services/sync/sync_engine_integration_test.dart` holds 145 cases, 14 of them
+`testWidgets`. Eight of those never reach `pumpAndSettle`'s quiet state; each one then fails on the
+*widget-test deadline* rather than on an assertion, which is why the reported error names no
+expectation and why the file alone takes **106 minutes** and reports **151 passed, 8 failed**. That
+one file is the whole reason a full local suite needs two hours instead of twenty-five minutes.
+
+The eight: `a hand-typed code announces the device it paired with`, `a peer card says how long ago,
+and one tile per address`, `the address repair stores the bare host, like pairing does`, `the delete
+gesture in the detail is what asks for the delete`, `the address detail is a sheet on a phone and a
+dialog on a desk`, `a peer card renders its outcome as chips, not one joined line`, `a settled session
+that moved nothing reads as up to date`, and `a card shows the online dot and the first-sync warning`.
+
+**They are not this re-base's damage**, and the proof is that there is nothing left to compare: the
+whole `lib/features/sync/` tree, `lib/shared/widgets/animated_progress_bar.dart` and every other
+widget those cases drive are byte-identical at `d28bc1cbb` (the old fork tip) and at the replay's tip,
+and the test file itself differs only by the pinned-SDK reformat — `git diff backup/master-d28bc1cbb
+HEAD -- lib/features/sync test/core/services/sync/sync_engine_integration_test.dart` prints 10
+insertions and 7 deletions, all of them line wrapping. The failure is a property of the fork's own
+sync UI on this machine, which is also the most likely explanation for the previous pass's
+unexplained `SyncProvider`-panel cases.
+
+The mechanism is worth knowing before touching them: a widget that keeps a frame scheduled keeps
+`pumpAndSettle` looping until *its* deadline (ten minutes) expires. The pairing dialog's countdown
+(`sync_pairing_dialogs.dart:94`) is a `Timer.periodic` that calls `setState` every second, and the
+panel's indeterminate bar (`animated_progress_bar.dart:75`) is an `AnimationController.repeat(reverse:
+true)`. Either one on screen is enough, and neither is what those cases assert on. The repair, when
+someone takes it, is bounded `pump(Duration)` loops in those eight cases (the pattern §4 counts) or
+making the two animations settle under a test's fake clock. It is not a registry entry: the entry
+would have to be true on CI too, and nothing here can show that.
