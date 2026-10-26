@@ -867,3 +867,24 @@ true)`. Either one on screen is enough, and neither is what those cases assert o
 someone takes it, is bounded `pump(Duration)` loops in those eight cases (the pattern §4 counts) or
 making the two animations settle under a test's fake clock. It is not a registry entry: the entry
 would have to be true on CI too, and nothing here can show that.
+
+## 16. Two failures in the `b1702b3a9` full run that the baseline did not cause
+
+The full suite at the replayed tip (the sync suite held aside, §15) ended at **11 248 passed, 70
+skipped, 67 failed**. Sixty-five are the registered platform set: 63 in `browser_native_engine_test`,
+`storage_image_usage_test`'s inline-code classification and `browser_page_card_test`'s teardown. The
+other two were new, and neither is the baseline's:
+
+- **`backup_encryption_test`: "cancellation during key derivation never publishes output"** failed in
+  its `tearDown`, not on its assertion — `PathAccessException: Deletion failed … errno = 32` on the
+  case's temporary directory. `encryptFile` runs in an isolate, and on cancellation that isolate can
+  still hold the file it was writing for a few milliseconds after the future completes; Windows will
+  not remove a directory that is still open. The repair sits in the test, where the race belongs: the
+  removal retries for up to 20 attempts at 25 ms, and the case then passes alone.
+- **`search_request_logging_test`: "search and usage requests are written to the common request log"**
+  failed once inside the full run and passed alone. It is a file-logging case, and the full run is the
+  only place it meets dozens of other suites' writers; there is no registry entry because an entry
+  would have to be true on the CI image as well, and nothing here can show that.
+
+Both were paid for on the spot rather than carried as known failures: an entry that names a case which
+passes on the next run is worse than none, because the next pass reads it as evidence.
