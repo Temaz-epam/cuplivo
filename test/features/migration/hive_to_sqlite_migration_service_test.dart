@@ -1831,7 +1831,9 @@ void main() {
           .where(
             (file) =>
                 file is File &&
-                p.basename(file.path).startsWith('${p.basename(legacy.path)}.retired-'),
+                p
+                    .basename(file.path)
+                    .startsWith('${p.basename(legacy.path)}.retired-'),
           )
           .cast<File>()
           .toList();

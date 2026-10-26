@@ -186,7 +186,9 @@ void main() {
         isTrue,
       );
       expect(
-        await File(p.join(target.path, 'upload', 'attachment.txt')).readAsString(),
+        await File(
+          p.join(target.path, 'upload', 'attachment.txt'),
+        ).readAsString(),
         'attachment',
       );
       await restart();
@@ -243,7 +245,9 @@ void main() {
       await restart();
       expect((await storage.directory).path, target.path);
       expect(
-        await File(p.join(target.path, 'upload', 'attachment.txt')).readAsString(),
+        await File(
+          p.join(target.path, 'upload', 'attachment.txt'),
+        ).readAsString(),
         'attachment',
       );
     },
@@ -358,7 +362,9 @@ void main() {
         isTrue,
       );
       expect(
-        await File(p.join(source.path, 'upload', 'attachment.txt')).readAsString(),
+        await File(
+          p.join(source.path, 'upload', 'attachment.txt'),
+        ).readAsString(),
         'updated after move',
       );
       expect((await storage.state).previous, isNotNull);
@@ -650,7 +656,9 @@ void main() {
       await expectLater(storage.cleanPrevious(), throwsFormatException);
       expect(await File(p.join(source.path, 'kelivo.db')).exists(), isTrue);
       expect(
-        await File(p.join(source.path, 'upload', 'attachment.txt')).readAsString(),
+        await File(
+          p.join(source.path, 'upload', 'attachment.txt'),
+        ).readAsString(),
         'attachment',
       );
     },

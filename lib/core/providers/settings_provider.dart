@@ -1568,7 +1568,9 @@ class SettingsProvider extends ChangeNotifier {
     }
 
     final cuplivo = _providerConfigs['KelivoIN'];
-    final cuplivoHost = Uri.tryParse(cuplivo?.baseUrl ?? '')?.host.toLowerCase();
+    final cuplivoHost = Uri.tryParse(
+      cuplivo?.baseUrl ?? '',
+    )?.host.toLowerCase();
     if (cuplivo != null &&
         (cuplivoHost == 'pollinations.ai' ||
             (cuplivoHost?.endsWith('.pollinations.ai') ?? false))) {
