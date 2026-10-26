@@ -2303,7 +2303,7 @@ class SettingsProvider extends ChangeNotifier {
     final services = List<SearchServiceOptions>.from(_searchServices);
     final common = _searchCommonOptions;
     for (final s in services) {
-      if (s is BingLocalOptions || s is CuplivoOptions) {
+      if (s is BingLocalOptions) {
         _searchConnection[s.id] = null;
         continue;
       }
@@ -5852,15 +5852,6 @@ Requirements:
   }
 
   // Search service settings
-  Future<bool> unlockCuplivoSearch() async {
-    if (_searchServices.any((s) => s is CuplivoOptions)) return false;
-    await setSearchServices([
-      ..._searchServices,
-      CuplivoOptions(id: CuplivoOptions.builtInId),
-    ]);
-    return true;
-  }
-
   Future<void> setSearchServices(List<SearchServiceOptions> services) async {
     _searchServices = List.from(services);
     final nextFetchMode = WebFetchService.effectiveMode(

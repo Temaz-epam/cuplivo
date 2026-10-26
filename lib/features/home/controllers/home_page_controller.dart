@@ -56,6 +56,7 @@ import '../../chat/utils/selection_markdown_memory.dart';
 import '../../chat/widgets/chat_message_widget.dart' show ToolUIPart;
 import '../../chat/widgets/message_edit_sheet.dart';
 import '../../chat/widgets/message_export_sheet.dart';
+import '../../chat/widgets/pdf_export_dialog.dart';
 import '../../../desktop/message_edit_dialog.dart';
 import '../../../desktop/hotkeys/chat_action_bus.dart';
 import '../../../desktop/hotkeys/sidebar_tab_bus.dart';
@@ -740,6 +741,11 @@ class HomePageController extends ChangeNotifier {
 
   ValueNotifier<String?> get processingFilesMessageId =>
       _viewModel.processingFilesMessageId;
+
+  /// Suggestions the displayed conversation may render. The switch decision
+  /// lives in [HomeViewModel.visibleChatSuggestions] so generation and
+  /// rendering cannot drift apart.
+  List<String> get visibleChatSuggestions => _viewModel.visibleChatSuggestions;
 
   /// Delivers every due proactive care letter (start/resume catch-up).
   Future<int> deliverDueProactiveCare() => _viewModel.deliverDueProactiveCare();
@@ -3178,6 +3184,40 @@ class HomePageController extends ChangeNotifier {
       messages: selected,
       showThinkingAndToolCards: showThinkingTools,
       expandThinkingContent: showThinkingContent,
+    );
+  }
+
+  Future<void> exportSelectedAsPdf() async {
+    final convo = currentConversation;
+    if (convo == null) return;
+    final context = _context;
+
+    final selected = await _selectedCollapsedMessages();
+    if (!context.mounted) return;
+    if (selected.isEmpty) {
+      final l10n = AppLocalizations.of(context)!;
+      showAppSnackBar(
+        context,
+        message: l10n.homePageSelectMessagesToShare,
+        type: NotificationType.info,
+      );
+      return;
+    }
+
+    final showThinkingTools = _showThinkingTools;
+    final showThinkingContent = _showThinkingContent;
+    final settings = context.read<SettingsProvider>();
+    cancelSelection();
+    await showPdfExportDialog(
+      context,
+      conversation: convo,
+      messages: selected,
+      showThinkingAndToolCards: showThinkingTools,
+      expandThinkingContent: showThinkingContent,
+      appFontPath: settings.appFontLocalPath,
+      codeFontPath: settings.codeFontLocalPath,
+      appFontFamily: settings.appFontFamily,
+      codeFontFamily: settings.codeFontFamily,
     );
   }
 

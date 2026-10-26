@@ -45,7 +45,6 @@ class AppSelectionArea extends StatefulWidget {
   /// Offers "Reply" beside the platform Copy, receiving the selection as
   /// markdown. Only a chat bubble passes one.
   final ValueChanged<String>? onReplySelection;
->>>>>>> 1d8d78971 (feat(reply): a message reply carries a quote citation, on markstream's selection (#1027))
 
   @override
   State<AppSelectionArea> createState() => _AppSelectionAreaState();

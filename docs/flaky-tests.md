@@ -769,3 +769,37 @@ it is a fixture that was never generated where it runs. And a test that mounts a
 to ask that service's platform rule before it runs, or the CI's operating system becomes an implicit,
 untested input.
 
+
+## 13. The `a02ee457a` baseline: genui fixtures and the browser engine are Windows-host failures
+
+The replay onto `a02ee457a` (2026-10-25) brought two upstream feature lines that this machine had
+never run: the generated-UI component set with its golden fixtures, and the embedded browser's
+native engine. Both are green on CI (`ubuntu-24.04`) and red here, and neither is a Cuplivo change -
+the control runs below are what says so.
+
+| test | how it fails on Windows | disposition |
+|---|---|---|
+| `test/goldens/genui_*_golden_test.dart` (241 cases), `tool_permissions_golden_test.dart` (8) | `Pixel test failed, 0.34 %-4.33 %`. The fixtures are new with this baseline - `git ls-tree 199647a5d test/goldens/baselines/genui` is empty, `a02ee457a` has 235 PNGs - and were generated on the CI image. `test/goldens/failures/<case>_isolatedDiff.png` shows the diff is glyph-shaped over every text run with no layout difference: Skia's text rasterisation, the same class as §10. | registered, `kind: "platform"` |
+| `browser_native_engine_test.dart` (63 of 64) | `UnimplementedError: addDevToolsProtocolEventListener is not implemented on the current platform`, thrown from `NativeBrowserEngine._installWindowsDialogs`, which `_onCreated` calls under `Platform.isWindows`. In a `flutter test` process that platform is the host, so the real plugin channel is reached and the method it lacks throws; on ubuntu the branch is skipped and the suite drives its fakes. | registered, `kind: "platform"` |
+
+Both were proved with a control run at upstream's own tip, `05506b840`, in a clean worktree
+(`git worktree add`, `flutter pub get`, the same file): `flutter test test/goldens` reports
+**2 passed, 251 failed** there and here, with the *same* percentages (dark inputs 2.05 %/10811 px on
+both, light table 3.46 %/24287 px on both), and `browser_native_engine_test.dart` reports
+**1 passed, 1 skipped, 63 failed** on both, with the same `UnimplementedError` 126 times. That is the
+fingerprint §10 describes: a registry entry is a claim about the platform, and the claim is only
+worth the control run behind it.
+
+One caveat worth writing down rather than re-discovering: four `browser_native_engine_test.dart` cases
+have a `:` inside their own description (`same-document back/forward settles loading (same URL: ...)`),
+and the local registry's name matching will not key them in any spelling that was tried - the plain
+form, the reporter's `>` rendering, or the truncated prefix. They stay the only `new` entries a local
+run reports (4 of 2900+), they fail identically at `05506b840`, and CI does not read this file at all
+(it is gitignored, `/.toolbridge/`), so the exception costs a sentence of interpretation and nothing
+else. If the file format is ever revisited, four cases with a colon in the name are the test corpus.
+
+Two fork-owned `pubspec.yaml` lines had to be put back by the replay, and neither is a platform fact:
+the version (upstream's `1.3.1+80` had overwritten `4.3.0+6`) and `assets/app_icon_about.png`, which
+the desktop tray, both About pages and `test/desktop/app_mark_assets_test.dart` need declared. That
+test loads the mark through `rootBundle`, so a dropped asset line fails it at runtime rather than at
+compile time - see the record in `docs/rebase-runbook.md`.

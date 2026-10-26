@@ -69,6 +69,7 @@ internationalization.md
 /.agents/
 /skills-lock.json
 /.scratch/
+/.worktrees/
 /.grok/
 # Local tool-bridge state: job logs and the known-failure registry.
 /.toolbridge/
