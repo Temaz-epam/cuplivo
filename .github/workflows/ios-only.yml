@@ -18,14 +18,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: 🔗 对齐 CuplivoISH 源文件
-        run: |
-          cd ios/Runner/Workspace
-          for f in CrashGuards.c Environment.m Executor.m Filesystem.m Kernel.m MountTarget.m; do
-            rm -f "CuplivoISH$f"
-            ln -s "KelivoISH$f" "CuplivoISH$f"
-          done
-
       - name: 🐦 安装 Flutter
         uses: subosito/flutter-action@v2
         with:
