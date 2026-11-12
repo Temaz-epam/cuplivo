@@ -1,0 +1,66 @@
+name: iOS IPA only
+
+env:
+  FLUTTER_VERSION: '3.47.6'
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  ios:
+    name: 构建 iOS
+    runs-on: macos-latest
+    permissions: write-all
+
+    steps:
+      - name: 📦 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 🐦 安装 Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: 🔧 关闭 Swift Package Manager
+        run: flutter config --no-enable-swift-package-manager
+
+      - name: 📝 获取版本号
+        id: version
+        run: |
+          VERSION=$(grep 'version:' pubspec.yaml | sed 's/version: //' | tr -d ' ')
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          VERSION="${VERSION}_${SHORT_SHA}"
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "版本号: $VERSION"
+
+      - name: 🧰 缓存 iSH 沙箱产物
+        uses: actions/cache@v4
+        with:
+          path: |
+            ios/sandbox/build
+            ios/sandbox/resources/alpine-rootfs.zip
+            ios/sandbox/resources/libvdso.so.elf
+          key: ${{ runner.os }}-${{ runner.arch }}-ish-sandbox-${{ hashFiles('ios/sandbox/build_ish.sh', 'ios/sandbox/ensure_artifacts.sh', 'ios/sandbox/patches/*.patch', 'ios/sandbox/prepare_alpine_rootfs.sh', 'ios/sandbox/resources/VERSION') }}
+
+      - name: 🧰 准备 iSH 沙箱产物
+        run: |
+          brew install meson ninja llvm lld libarchive
+          ios/sandbox/ensure_artifacts.sh
+
+      - name: 🏗️ 构建 iOS (无签名)
+        run: |
+          flutter build ios --release --no-codesign
+          cd build/ios/iphoneos
+          mkdir Payload
+          cp -r Runner.app Payload/
+          zip -r ../../../Cuplivo_ios_${VERSION}.ipa Payload
+
+      - name: 📤 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: iOS-IPA
+          path: Cuplivo_ios_*.ipa
